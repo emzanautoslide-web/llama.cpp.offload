@@ -1,5 +1,9 @@
 #include "llama-context.h"
 
+#ifdef LLAMA_MOE_OFFLOAD
+#include "moe-offload/runtime.h"
+#endif
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -3925,7 +3929,13 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+#ifdef LLAMA_MOE_OFFLOAD
+    llama_moe::begin_request();
+#endif
     const int ret = ctx->decode(batch);
+#ifdef LLAMA_MOE_OFFLOAD
+    llama_moe::end_request();
+#endif
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

@@ -1,5 +1,9 @@
 #include "llama-graph.h"
 
+#ifdef LLAMA_MOE_OFFLOAD
+#include "moe-offload/runtime.h"
+#endif
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1474,6 +1478,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
+
+#ifdef LLAMA_MOE_OFFLOAD
+    selected_experts = llama_moe::remap_selected_experts(ctx0, selected_experts, il, n_expert, n_expert_used);
+#endif
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented

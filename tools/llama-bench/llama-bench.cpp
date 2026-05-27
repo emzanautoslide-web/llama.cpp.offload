@@ -334,6 +334,15 @@ struct cmd_params {
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
+#ifdef LLAMA_MOE_OFFLOAD
+    bool                             moe_offload;
+    int                              moe_cache_vram_mb;
+    float                            moe_cache_vram_frac;
+    std::string                      moe_predictor;
+    std::string                      moe_profile_csv;
+    std::string                      moe_profile_summary;
+    bool                             moe_oracle;
+#endif
     std::vector<llama_split_mode>    split_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
@@ -378,6 +387,15 @@ static const cmd_params cmd_params_defaults = {
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { 99 },
     /* n_cpu_moe            */ { 0 },
+#ifdef LLAMA_MOE_OFFLOAD
+    /* moe_offload          */ false,
+    /* moe_cache_vram_mb    */ 0,
+    /* moe_cache_vram_frac  */ 0.0f,
+    /* moe_predictor        */ "lru",
+    /* moe_profile_csv      */ "",
+    /* moe_profile_summary  */ "",
+    /* moe_oracle           */ false,
+#endif
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
@@ -448,6 +466,15 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                            (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                    (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                     (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+#ifdef LLAMA_MOE_OFFLOAD
+    printf("  --moe-offload                               enable MoE expert offload metadata path\n");
+    printf("  --moe-cache-vram-mb <n>                     expert cache VRAM budget in MiB (default: %d)\n", cmd_params_defaults.moe_cache_vram_mb);
+    printf("  --moe-cache-vram-frac <f>                   expert cache fraction of free VRAM (default: %.2f)\n", (double) cmd_params_defaults.moe_cache_vram_frac);
+    printf("  --moe-predictor <lru|eamc>                  expert cache predictor (default: %s)\n", cmd_params_defaults.moe_predictor.c_str());
+    printf("  --moe-profile-csv <path>                    write MoE profiling CSV\n");
+    printf("  --moe-profile-summary <path>                write MoE profiling summary\n");
+    printf("  --moe-oracle                                enable MoE oracle diagnostic mode\n");
+#endif
     printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -719,6 +746,54 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+#ifdef LLAMA_MOE_OFFLOAD
+            } else if (arg == "--moe-offload") {
+                params.moe_offload = true;
+            } else if (arg == "--moe-cache-vram-mb") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_cache_vram_mb = std::stoi(argv[i]);
+                if (params.moe_cache_vram_mb < 0) {
+                    invalid_param = true;
+                    break;
+                }
+            } else if (arg == "--moe-cache-vram-frac") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_cache_vram_frac = std::stof(argv[i]);
+                if (params.moe_cache_vram_frac < 0.0f || params.moe_cache_vram_frac > 1.0f) {
+                    invalid_param = true;
+                    break;
+                }
+            } else if (arg == "--moe-predictor") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_predictor = argv[i];
+                if (params.moe_predictor != "lru" && params.moe_predictor != "eamc") {
+                    invalid_param = true;
+                    break;
+                }
+            } else if (arg == "--moe-profile-csv") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_profile_csv = argv[i];
+            } else if (arg == "--moe-profile-summary") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_profile_summary = argv[i];
+            } else if (arg == "--moe-oracle") {
+                params.moe_oracle = true;
+#endif
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1135,6 +1210,15 @@ struct cmd_params_instance {
     int                poll;
     int                n_gpu_layers;
     int                n_cpu_moe;
+#ifdef LLAMA_MOE_OFFLOAD
+    bool               moe_offload;
+    int                moe_cache_vram_mb;
+    float              moe_cache_vram_frac;
+    std::string        moe_predictor;
+    std::string        moe_profile_csv;
+    std::string        moe_profile_summary;
+    bool               moe_oracle;
+#endif
     llama_split_mode   split_mode;
     int                main_gpu;
     bool               no_kv_offload;
@@ -1163,6 +1247,15 @@ struct cmd_params_instance {
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
+    #ifdef LLAMA_MOE_OFFLOAD
+        mparams.moe_offload         = moe_offload;
+        mparams.moe_cache_vram_mb   = moe_cache_vram_mb < 0 ? 0 : (uint64_t) moe_cache_vram_mb;
+        mparams.moe_cache_vram_frac = moe_cache_vram_frac;
+        mparams.moe_predictor       = moe_predictor.c_str();
+        mparams.moe_profile_csv     = moe_profile_csv.empty() ? nullptr : moe_profile_csv.c_str();
+        mparams.moe_profile_summary = moe_profile_summary.empty() ? nullptr : moe_profile_summary.c_str();
+        mparams.moe_oracle          = moe_oracle;
+    #endif
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1209,6 +1302,15 @@ struct cmd_params_instance {
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
                devices == other.devices &&
+#ifdef LLAMA_MOE_OFFLOAD
+               moe_offload == other.moe_offload &&
+               moe_cache_vram_mb == other.moe_cache_vram_mb &&
+               moe_cache_vram_frac == other.moe_cache_vram_frac &&
+               moe_predictor == other.moe_predictor &&
+               moe_profile_csv == other.moe_profile_csv &&
+               moe_profile_summary == other.moe_profile_summary &&
+               moe_oracle == other.moe_oracle &&
+#endif
                no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1281,6 +1383,15 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll         = */ pl,
                 /* .n_gpu_layers = */ nl,
                 /* .n_cpu_moe    = */ ncmoe,
+#ifdef LLAMA_MOE_OFFLOAD
+                /* .moe_offload  = */ params.moe_offload,
+                /* .moe_cache_vram_mb   = */ params.moe_cache_vram_mb,
+                /* .moe_cache_vram_frac = */ params.moe_cache_vram_frac,
+                /* .moe_predictor       = */ params.moe_predictor,
+                /* .moe_profile_csv     = */ params.moe_profile_csv,
+                /* .moe_profile_summary = */ params.moe_profile_summary,
+                /* .moe_oracle          = */ params.moe_oracle,
+#endif
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
@@ -1318,6 +1429,15 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll         = */ pl,
                 /* .n_gpu_layers = */ nl,
                 /* .n_cpu_moe    = */ ncmoe,
+#ifdef LLAMA_MOE_OFFLOAD
+                /* .moe_offload  = */ params.moe_offload,
+                /* .moe_cache_vram_mb   = */ params.moe_cache_vram_mb,
+                /* .moe_cache_vram_frac = */ params.moe_cache_vram_frac,
+                /* .moe_predictor       = */ params.moe_predictor,
+                /* .moe_profile_csv     = */ params.moe_profile_csv,
+                /* .moe_profile_summary = */ params.moe_profile_summary,
+                /* .moe_oracle          = */ params.moe_oracle,
+#endif
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
@@ -1355,6 +1475,15 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll         = */ pl,
                 /* .n_gpu_layers = */ nl,
                 /* .n_cpu_moe    = */ ncmoe,
+#ifdef LLAMA_MOE_OFFLOAD
+                /* .moe_offload  = */ params.moe_offload,
+                /* .moe_cache_vram_mb   = */ params.moe_cache_vram_mb,
+                /* .moe_cache_vram_frac = */ params.moe_cache_vram_frac,
+                /* .moe_predictor       = */ params.moe_predictor,
+                /* .moe_profile_csv     = */ params.moe_profile_csv,
+                /* .moe_profile_summary = */ params.moe_profile_summary,
+                /* .moe_oracle          = */ params.moe_oracle,
+#endif
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,

@@ -53,6 +53,18 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_MOE_OFFLOAD)
+    target_sources(llama PRIVATE
+        moe-offload/cache.cpp
+        moe-offload/loader.cpp
+        moe-offload/platform_io.cpp
+        moe-offload/predictor.cpp
+        moe-offload/profiler.cpp
+        moe-offload/runtime.cpp
+    )
+    target_compile_definitions(llama PUBLIC LLAMA_MOE_OFFLOAD)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

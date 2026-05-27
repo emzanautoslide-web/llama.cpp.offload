@@ -2270,6 +2270,66 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.use_mmap = value;
         }
     ).set_env("LLAMA_ARG_MMAP"));
+#ifdef LLAMA_MOE_OFFLOAD
+    add_opt(common_arg(
+        {"--moe-offload"},
+        "enable MoE expert offloading for GGUFs repacked with llama-moe-repack",
+        [](common_params & params) {
+            params.moe_offload = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-cache-vram-mb"}, "N",
+        "VRAM budget for the MoE expert cache, in MiB",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_vram_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-cache-vram-frac"}, "F",
+        "fraction of free VRAM to reserve for the MoE expert cache",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_vram_frac = std::stof(value);
+            if (params.moe_cache_vram_frac < 0.0f || params.moe_cache_vram_frac > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-predictor"}, "{lru,eamc}",
+        "expert-cache predictor to use with --moe-offload",
+        [](common_params & params, const std::string & value) {
+            if (value != "lru" && value != "eamc") {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_predictor = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-profile-csv"}, "PATH",
+        "write per-layer MoE offload profiling rows to PATH",
+        [](common_params & params, const std::string & value) {
+            params.moe_profile_csv = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-profile-summary"}, "PATH",
+        "write MoE offload profiling summary to PATH instead of stdout",
+        [](common_params & params, const std::string & value) {
+            params.moe_profile_summary = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-oracle"},
+        "enable diagnostic oracle mode for MoE offload profiling",
+        [](common_params & params) {
+            params.moe_oracle = true;
+        }
+    ));
+#endif
     add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},

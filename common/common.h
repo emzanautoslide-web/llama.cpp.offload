@@ -557,6 +557,16 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+#ifdef LLAMA_MOE_OFFLOAD
+    bool        moe_offload            = false;
+    int32_t     moe_cache_vram_mb      = 0;
+    float       moe_cache_vram_frac    = 0.0f;
+    std::string moe_predictor          = "lru";
+    std::string moe_profile_csv        = "";
+    std::string moe_profile_summary    = "";
+    bool        moe_oracle             = false;
+#endif
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
