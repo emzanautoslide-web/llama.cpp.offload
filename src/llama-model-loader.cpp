@@ -1284,6 +1284,75 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+struct ggml_tensor * llama_model_loader::create_unfiled_tensor(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        const std::string & name, ggml_type type, ggml_op op,
+        const std::initializer_list<int64_t> & ne) {
+    if (buft_list_layer == nullptr || buft_list_layer->empty()) {
+        throw std::runtime_error(format("create_unfiled_tensor: no buft list for tensor %s", name.c_str()));
+    }
+
+    // build a fake tensor meta for buft selection
+    ggml_tensor t_meta;
+    memset(&t_meta, 0, sizeof(ggml_tensor));
+    t_meta.type = type;
+    for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+        t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+        GGML_ASSERT(t_meta.ne[dim] >= 1);
+        t_meta.nb[dim] = dim == 0 ? ggml_type_size(type) : t_meta.ne[dim-1] * t_meta.nb[dim-1];
+    }
+    ggml_set_name(&t_meta, name.c_str());
+
+    ggml_backend_buffer_type_t buft = select_weight_buft(hparams, &t_meta, op, buft_list_layer);
+    if (buft == nullptr) {
+        throw std::runtime_error(format("create_unfiled_tensor: failed to select buft for %s", name.c_str()));
+    }
+
+    // avoid host buffer when using mmap (mirrors create_tensor's logic)
+    auto * buft_dev = ggml_backend_buft_get_device(buft);
+    if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu_dev) {
+            throw std::runtime_error("no CPU backend found");
+        }
+        buft = ggml_backend_dev_buffer_type(cpu_dev);
+    }
+
+    // get or create a ggml_context for this buft (mirrors the lambda inside create_tensor)
+    auto it = ctx_map.find(buft);
+    ggml_context * ctx = nullptr;
+    if (it == ctx_map.end()) {
+        int max_n_tensors = n_tensors + 1 + (int) hparams.n_layer * 2;
+        if (files.empty()) {
+            max_n_tensors += (int) hparams.n_layer * 256;
+        }
+        const size_t ctx_size = ggml_tensor_overhead() * max_n_tensors;
+        ggml_init_params params = { ctx_size, NULL, true };
+        ctx = ggml_init(params);
+        if (!ctx) {
+            throw std::runtime_error("create_unfiled_tensor: failed to create ggml context");
+        }
+        ctx_map.emplace(buft, ctx);
+    } else {
+        ctx = it->second.get();
+    }
+
+    ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+    ggml_set_name(tensor, name.c_str());
+    // NOTE: do not increment n_created — this tensor is NOT in any source GGUF
+    // and is therefore not counted by done_getting_tensors against n_tensors.
+    return tensor;
+}
+
+void llama_model_loader::mark_tensor_unloaded(const std::string & name) {
+    auto it = weights_map.find(name);
+    if (it == weights_map.end()) {
+        throw std::runtime_error(format("mark_tensor_unloaded: weight '%s' not found in GGUF", name.c_str()));
+    }
+    size_data -= ggml_nbytes(it->second.tensor);
+    n_created++;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required) {
     const struct ggml_tensor * cur = check_tensor_dims(name, ne, required);
 

@@ -2,6 +2,7 @@
 
 #include "predictor.h"
 #include "runtime.h"
+#include "slot_pool.h"
 
 #include "gguf.h"
 #include "llama-impl.h"
@@ -52,7 +53,7 @@ std::string read_string(const gguf_context * ctx, const char * key) {
 
 } // namespace
 
-manifest inspect_manifest(const gguf_context * ctx) {
+manifest inspect_manifest(const gguf_context * ctx, const std::string & source_path) {
     manifest result;
     if (!ctx) {
         return result;
@@ -63,25 +64,38 @@ manifest inspect_manifest(const gguf_context * ctx) {
     }
 
     result.present = true;
+    result.source_path = source_path;
+    result.data_offset = (uint64_t) gguf_get_data_offset(ctx);
     read_u32(ctx, "moe_offload.n_moe_layers", result.n_layers);
     read_u32(ctx, "moe_offload.n_experts_per_layer", result.n_experts_per_layer);
     read_u64(ctx, "moe_offload.expert_blob_size_max", result.expert_blob_size_max);
     result.layout = read_string(ctx, "moe_offload.layout");
 
+    const int64_t layer_ids_kid = gguf_find_key(ctx, "moe_offload.layer_ids");
+    if (layer_ids_kid >= 0 && gguf_get_kv_type(ctx, layer_ids_kid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(ctx, layer_ids_kid) == GGUF_TYPE_UINT32) {
+        const size_t n = gguf_get_arr_n(ctx, layer_ids_kid);
+        const auto * data = static_cast<const uint32_t *>(gguf_get_arr_data(ctx, layer_ids_kid));
+        result.layer_ids.assign(data, data + n);
+    }
+    if (result.layer_ids.empty() && result.n_layers > 0) {
+        // legacy / v1 layout: assume contiguous transformer layers 0..n-1
+        result.layer_ids.resize(result.n_layers);
+        for (uint32_t i = 0; i < result.n_layers; ++i) result.layer_ids[i] = i;
+    }
+    if (!result.layer_ids.empty()) {
+        result.n_layers = (uint32_t) result.layer_ids.size();
+    }
+
     const int64_t table_kid = gguf_find_key(ctx, "moe_offload.expert_blob.table");
     if (table_kid >= 0 && gguf_get_kv_type(ctx, table_kid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(ctx, table_kid) == GGUF_TYPE_UINT64) {
         const size_t n = gguf_get_arr_n(ctx, table_kid);
         const auto * data = static_cast<const uint64_t *>(gguf_get_arr_data(ctx, table_kid));
-        if (data && n % 2 == 0 && result.n_layers > 0 && result.n_experts_per_layer > 0) {
-            const size_t n_records = std::min(n / 2, (size_t) result.n_layers * (size_t) result.n_experts_per_layer);
-            result.experts.reserve(n_records);
-            for (size_t i = 0; i < n_records; ++i) {
-                expert_record rec;
-                rec.file_offset = data[2 * i + 0];
-                rec.size = data[2 * i + 1];
-                rec.layer = (uint16_t) (i / result.n_experts_per_layer);
-                rec.expert = (uint16_t) (i % result.n_experts_per_layer);
-                result.experts.push_back(rec);
+        const size_t expected = (size_t) result.n_layers * (size_t) result.n_experts_per_layer * (size_t) EXPERT_KIND_COUNT * 2;
+        if (data && n == expected && expected > 0) {
+            result.experts.resize(expected / 2);
+            for (size_t i = 0; i < result.experts.size(); ++i) {
+                result.experts[i].rel_offset = data[2 * i + 0];
+                result.experts[i].size = data[2 * i + 1];
             }
         }
     }
@@ -89,17 +103,43 @@ manifest inspect_manifest(const gguf_context * ctx) {
     return result;
 }
 
+const char * expert_kind_name(expert_kind k) {
+    switch (k) {
+        case EXPERT_GATE: return "gate";
+        case EXPERT_UP:   return "up";
+        case EXPERT_DOWN: return "down";
+        default:          return "?";
+    }
+}
+
+const expert_record & manifest::at(uint32_t logical_layer, uint32_t expert, expert_kind kind) const {
+    static const expert_record empty{};
+    const size_t idx = ((size_t) logical_layer * n_experts_per_layer + expert) * EXPERT_KIND_COUNT + (size_t) kind;
+    if (idx >= experts.size()) {
+        return empty;
+    }
+    return experts[idx];
+}
+
+int manifest::logical_layer_of(uint32_t transformer_layer) const {
+    for (size_t i = 0; i < layer_ids.size(); ++i) {
+        if (layer_ids[i] == transformer_layer) return (int) i;
+    }
+    return -1;
+}
+
 bool configure_from_params(
         const llama_model_params & params,
         const std::string & model_path,
         const llama_model_loader & ml) {
-    manifest mf = inspect_manifest(ml.metadata);
+    manifest mf = inspect_manifest(ml.metadata, model_path);
 
     if (!params.moe_offload) {
         if (mf.present) {
             LLAMA_LOG_INFO("%s: MoE offload metadata detected; runtime flag is disabled\n", __func__);
         }
         configure_runtime({}, mf);
+        reset_slot_pool();
         return true;
     }
 
@@ -126,6 +166,7 @@ bool configure_from_params(
     }
 
     configure_runtime(opts, mf);
+    configure_slot_pool();
         LLAMA_LOG_INFO("%s: enabled MoE offload metadata v%u, layout=%s, predictor=%s, cache=%llu MiB\n",
             __func__, mf.version, mf.layout.empty() ? "unknown" : mf.layout.c_str(), opts.predictor.c_str(), (unsigned long long) opts.cache_vram_mb);
     return true;

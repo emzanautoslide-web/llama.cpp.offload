@@ -19,6 +19,11 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#ifdef LLAMA_MOE_OFFLOAD
+#include "moe-offload/runtime.h"
+#include "moe-offload/slot_pool.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -1561,6 +1566,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#ifdef LLAMA_MOE_OFFLOAD
+    if (llama_moe::runtime_enabled()) {
+        if (!llama_moe::prefetch_all_experts()) {
+            LLAMA_LOG_ERROR("%s: MoE offload expert prefetch failed\n", __func__);
+            return false;
+        }
+    }
+#endif
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -1572,6 +1586,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+#ifdef LLAMA_MOE_OFFLOAD
+    if (llama_moe::runtime_enabled() && buft_list_layer != nullptr) {
+        if (ggml_tensor * slot = llama_moe::intercept_expert_tensor(ml, hparams, buft_list_layer, tn, ne, flags)) {
+            return slot;
+        }
+    }
+#endif
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);

@@ -61,6 +61,7 @@ if (LLAMA_MOE_OFFLOAD)
         moe-offload/predictor.cpp
         moe-offload/profiler.cpp
         moe-offload/runtime.cpp
+        moe-offload/slot_pool.cpp
     )
     target_compile_definitions(llama PUBLIC LLAMA_MOE_OFFLOAD)
 endif()

@@ -24,6 +24,9 @@ struct runtime_options {
 void configure_runtime(const runtime_options & options, const manifest & mf);
 bool runtime_enabled();
 
+const runtime_options & get_options();
+const manifest &        get_manifest();
+
 void begin_request();
 void end_request();
 

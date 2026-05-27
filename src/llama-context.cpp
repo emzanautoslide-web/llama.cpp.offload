@@ -2,6 +2,7 @@
 
 #ifdef LLAMA_MOE_OFFLOAD
 #include "moe-offload/runtime.h"
+#include "moe-offload/slot_pool.h"
 #endif
 
 #include "ggml.h"
@@ -1279,7 +1280,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
+#ifdef LLAMA_MOE_OFFLOAD
+        if (llama_moe::runtime_enabled()) {
+            llama_moe::reset_graph_state();
+        }
+        if (llama_moe::runtime_enabled() && llama_moe::streaming_mode()) {
+            ggml_backend_sched_set_eval_callback(sched.get(), llama_moe::moe_eval_callback, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
+#else
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+#endif
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1306,6 +1318,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+#ifdef LLAMA_MOE_OFFLOAD
+        if (llama_moe::runtime_enabled()) {
+            if (!llama_moe::streaming_mode()) {
+                llama_moe::populate_slot_tables_identity();
+            }
+        }
+#endif
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
