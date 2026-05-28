@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama.h"
+
 #include <cstdint>
 #include <fstream>
 #include <string>
@@ -42,6 +44,22 @@ struct profile_snapshot {
     profile_phase_stats decode;
 };
 
+struct profile_summary_context {
+    std::string model;
+    std::string predictor;
+    std::string storage;
+    uint64_t cache_mb = 0;
+    int n_prompt = 0;
+    int n_gen = 0;
+    int n_repeat = 1;
+    double ttft_ms = 0.0;
+    double tpot_ms = 0.0;
+    double total_ms = 0.0;
+    uint64_t vram_peak_bytes = 0;
+    uint64_t vram_total_bytes = 0;
+    uint64_t dram_peak_bytes = 0;
+};
+
 class profiler {
 public:
     profiler() = default;
@@ -62,5 +80,9 @@ private:
     profile_phase_stats prefill_stats;
     profile_phase_stats decode_stats;
 };
+
+LLAMA_API std::string format_summary(
+    const profile_summary_context & ctx,
+    const profile_snapshot & profile);
 
 } // namespace llama_moe

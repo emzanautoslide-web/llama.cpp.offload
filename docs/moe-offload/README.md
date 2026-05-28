@@ -6,7 +6,7 @@ This fork adds a guarded MoE offload overlay behind `LLAMA_MOE_OFFLOAD`. The def
 
 ```bash
 cmake -B build-moe -DLLAMA_MOE_OFFLOAD=ON -DGGML_CUDA=ON
-cmake --build build-moe --config Release
+cmake --build build-moe --config Release --target llama-moe-bench
 ```
 
 ## Repack
@@ -47,8 +47,10 @@ The current repacker writes a stock-loadable GGUF with page-aligned tensor data 
 The bench tool enables MoE offload automatically, runs prefill + decode loops,
 and always prints the summary report to stdout. If `--moe-profile-summary` is
 set, `llama-moe-bench` writes the same §4.7 report to that path after all
-repeats complete. It intentionally does not use the runtime `end_request()`
-summary writer, which emits the older aggregate-only format. If
+repeats complete. During long runs, it also checkpoints the same summary file
+after prefill and after each completed repeat, so the file appears before the
+full benchmark finishes. It intentionally does not use the runtime
+`end_request()` summary writer, which emits the older aggregate-only format. If
 `--moe-profile-csv` is set, a per-layer profile CSV is written to that path.
 
 Example summary:

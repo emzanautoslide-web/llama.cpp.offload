@@ -341,6 +341,63 @@ int main(int argc, char ** argv) {
     tpot_ms.reserve((size_t) p.n_repeat);
     total_ms.reserve((size_t) p.n_repeat);
 
+    int exit_code = 0;
+
+    auto average_or_zero = [](const std::vector<double> & values) -> double {
+        if (values.empty()) {
+            return 0.0;
+        }
+        double total = 0.0;
+        for (double value : values) {
+            total += value;
+        }
+        return total / (double) values.size();
+    };
+
+    auto write_summary = [&](bool print_stdout) -> llama_moe::profile_snapshot {
+        llama_moe::profile_summary_context summary_ctx;
+        summary_ctx.model = model_desc.empty() ? basename_of(p.model) : model_desc;
+        summary_ctx.predictor = p.moe_predictor;
+        summary_ctx.storage = storage_label_of(p.model);
+        summary_ctx.cache_mb = (uint64_t) p.moe_cache_mb;
+        summary_ctx.n_prompt = n_prompt_tokens;
+        summary_ctx.n_gen = p.n_gen;
+        summary_ctx.n_repeat = (int) std::max<size_t>(1, std::max(ttft_ms.size(), total_ms.size()));
+        summary_ctx.ttft_ms = average_or_zero(ttft_ms);
+        summary_ctx.tpot_ms = average_or_zero(tpot_ms);
+        summary_ctx.total_ms = total_ms.empty() ? summary_ctx.ttft_ms : average_or_zero(total_ms);
+        summary_ctx.vram_peak_bytes = vram_peak_bytes;
+        summary_ctx.vram_total_bytes = vram_total_bytes;
+        summary_ctx.dram_peak_bytes = dram_peak_bytes;
+
+        const llama_moe::profile_snapshot profile = llama_moe::get_profile_snapshot();
+        const std::string summary = llama_moe::format_summary(summary_ctx, profile);
+
+        if (print_stdout) {
+            fputc('\n', stdout);
+            fputs(summary.c_str(), stdout);
+            fflush(stdout);
+        }
+
+        if (!p.moe_profile_summary.empty()) {
+            fprintf(stderr, "[moe-bench] writing summary to: %s\n", p.moe_profile_summary.c_str());
+            std::ofstream out(p.moe_profile_summary, std::ios::out | std::ios::trunc);
+            if (!out) {
+                fprintf(stderr, "[moe-bench] ERROR: failed to open summary file: %s\n", p.moe_profile_summary.c_str());
+            } else {
+                out << summary;
+                out.close();
+                if (out.fail()) {
+                    fprintf(stderr, "[moe-bench] ERROR: write failed for summary file: %s\n", p.moe_profile_summary.c_str());
+                } else if (print_stdout) {
+                    fprintf(stderr, "[moe-bench] summary written successfully to: %s\n", p.moe_profile_summary.c_str());
+                }
+            }
+        }
+
+        return profile;
+    };
+
     for (int rep = 0; rep < p.n_repeat; ++rep) {
         llama_memory_clear(llama_get_memory(ctx), true);
         llama_perf_context_reset(ctx);
@@ -348,20 +405,20 @@ int main(int argc, char ** argv) {
         const double t0 = now_ms();
         llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt_tokens);
         if (llama_decode(ctx, batch) != 0) {
-            fprintf(stderr, "prefill decode failed\n");
-            llama_free(ctx);
-            llama_model_free(model);
-            llama_backend_free();
-            return 1;
+            fprintf(stderr, "prefill decode failed (rep %d)\n", rep);
+            exit_code = 1;
+            break;
         }
         const double t1 = now_ms();
         ttft_ms.push_back(t1 - t0);
+        write_summary(false);
 
         llama_token token = greedy_token(ctx, vocab_size);
         for (int gen = 0; gen < p.n_gen; ++gen) {
             batch = llama_batch_get_one(&token, 1);
             if (llama_decode(ctx, batch) != 0) {
-                fprintf(stderr, "decode failed at gen %d\n", gen);
+                fprintf(stderr, "decode failed at gen %d (rep %d)\n", gen, rep);
+                exit_code = 1;
                 break;
             }
             token = greedy_token(ctx, vocab_size);
@@ -374,45 +431,21 @@ int main(int argc, char ** argv) {
         total_ms.push_back(t2 - t0);
         vram_peak_bytes = std::max(vram_peak_bytes, sample_vram_used_bytes(&vram_total_bytes));
         dram_peak_bytes = std::max(dram_peak_bytes, process_dram_peak_bytes());
+        write_summary(false);
     }
 
-    double avg_ttft = 0.0;
-    double avg_tpot = 0.0;
-    double avg_total = 0.0;
-    for (size_t i = 0; i < ttft_ms.size(); ++i) {
-        avg_ttft += ttft_ms[i];
-        avg_tpot += tpot_ms[i];
-        avg_total += total_ms[i];
-    }
-    const double repeats = (double) std::max<size_t>(1, ttft_ms.size());
-    avg_ttft /= repeats;
-    avg_tpot /= repeats;
-    avg_total /= repeats;
-
-    const llama_moe::profile_snapshot profile = llama_moe::get_profile_snapshot();
-
-    const std::string summary = build_summary(
-            p, model_desc, n_prompt_tokens, avg_ttft, avg_tpot, avg_total,
-            profile, vram_peak_bytes, vram_total_bytes, dram_peak_bytes);
-
-    fputc('\n', stdout);
-    fputs(summary.c_str(), stdout);
-
-    if (!p.moe_profile_summary.empty()) {
-        std::ofstream out(p.moe_profile_summary, std::ios::out | std::ios::trunc);
-        if (!out) {
-            fprintf(stderr, "failed to write profile summary: %s\n", p.moe_profile_summary.c_str());
-        } else {
-            out << summary;
-            fprintf(stdout, "\nProfile summary written to: %s\n", p.moe_profile_summary.c_str());
-        }
-    }
+    fprintf(stderr, "[moe-bench] computing summary...\n");
+    const llama_moe::profile_snapshot profile = write_summary(true);
     if (profile.prefill.rows + profile.decode.rows == 0) {
         fprintf(stderr, "warning: no MoE profile rows were recorded; check that the model is a repacked *.moe.gguf and that the run entered streaming mode\n");
     }
 
+    fprintf(stderr, "[moe-bench] done. prefill_rows=%llu decode_rows=%llu\n",
+            (unsigned long long) profile.prefill.rows,
+            (unsigned long long) profile.decode.rows);
+
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
-    return 0;
+    return exit_code;
 }
