@@ -38,9 +38,9 @@ void configure_runtime(const runtime_options & options, const manifest & mf) {
     s.request_idx = 0;
     s.prof.reset();
 
-    if (s.options.enabled && !s.options.profile_csv.empty()) {
+    if (s.options.enabled) {
         s.prof.reset(new profiler());
-        if (!s.prof->open(s.options.profile_csv)) {
+        if (!s.options.profile_csv.empty() && !s.prof->open(s.options.profile_csv)) {
             LLAMA_LOG_WARN("%s: failed to open MoE profile CSV: %s\n", __func__, s.options.profile_csv.c_str());
             s.prof.reset();
         }
@@ -88,6 +88,17 @@ void end_request() {
 profiler * get_profiler() {
     auto & s = state();
     return s.prof.get();
+}
+
+profile_snapshot get_profile_snapshot() {
+    profile_snapshot snap;
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.prof) {
+        s.prof->flush();
+        snap = s.prof->snapshot();
+    }
+    return snap;
 }
 
 ggml_tensor * remap_selected_experts(

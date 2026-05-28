@@ -10,9 +10,7 @@ profiler::profiler(const std::string & csv_path) {
 }
 
 profiler::~profiler() {
-    if (csv.is_open()) {
-        csv.flush();
-    }
+    flush();
 }
 
 bool profiler::open(const std::string & csv_path) {
@@ -28,14 +26,20 @@ bool profiler::open(const std::string & csv_path) {
 }
 
 void profiler::record(const profile_row & row) {
-    ++rows;
-    required += (uint64_t) row.k_required;
-    hits += (uint64_t) row.k_hit;
-    misses += (uint64_t) row.k_miss;
-    ssd_read_us += row.ssd_read_us;
-    h2d_us += row.h2d_us;
-    compute_us += row.compute_us;
-    stall_us += row.stall_us;
+    profile_phase_stats & stats = row.phase == "prefill" ? prefill_stats : decode_stats;
+    ++stats.rows;
+    stats.required += (uint64_t) row.k_required;
+    stats.hits += (uint64_t) row.k_hit;
+    stats.misses += (uint64_t) row.k_miss;
+    stats.ssd_bytes += row.ssd_bytes;
+    stats.ssd_reads += row.ssd_reads;
+    stats.ssd_read_us += row.ssd_read_us;
+    stats.h2d_us += row.h2d_us;
+    stats.compute_us += row.compute_us;
+    stats.stall_us += row.stall_us;
+    if (row.cache_resident_experts > stats.cache_resident_peak) {
+        stats.cache_resident_peak = row.cache_resident_experts;
+    }
 
     if (csv.is_open()) {
         csv << row.token_idx << ','
@@ -53,20 +57,54 @@ void profiler::record(const profile_row & row) {
     }
 }
 
+void profiler::flush() {
+    if (csv.is_open()) {
+        csv.flush();
+    }
+}
+
+profile_snapshot profiler::snapshot() const {
+    profile_snapshot snap;
+    snap.prefill = prefill_stats;
+    snap.decode = decode_stats;
+    return snap;
+}
+
 std::string profiler::summary() const {
     std::ostringstream out;
-    const double hit_rate = required == 0 ? 0.0 : 100.0 * (double) hits / (double) required;
+    const profile_phase_stats stats = total();
+    const double hit_rate = stats.required == 0 ? 0.0 : 100.0 * (double) stats.hits / (double) stats.required;
     out << "MoE offload summary\n";
-    out << "rows: " << rows << '\n';
-    out << "experts required: " << required << '\n';
-    out << "cache hits: " << hits << '\n';
-    out << "cache misses: " << misses << '\n';
+    out << "rows: " << stats.rows << '\n';
+    out << "experts required: " << stats.required << '\n';
+    out << "cache hits: " << stats.hits << '\n';
+    out << "cache misses: " << stats.misses << '\n';
     out << "cache hit rate: " << std::fixed << std::setprecision(2) << hit_rate << "%\n";
-    out << "ssd_read_us: " << ssd_read_us << '\n';
-    out << "h2d_us: " << h2d_us << '\n';
-    out << "compute_us: " << compute_us << '\n';
-    out << "stall_us: " << stall_us << '\n';
+    out << "ssd_bytes: " << stats.ssd_bytes << '\n';
+    out << "ssd_reads: " << stats.ssd_reads << '\n';
+    out << "ssd_read_us: " << stats.ssd_read_us << '\n';
+    out << "h2d_us: " << stats.h2d_us << '\n';
+    out << "compute_us: " << stats.compute_us << '\n';
+    out << "stall_us: " << stats.stall_us << '\n';
     return out.str();
+}
+
+profile_phase_stats profiler::total() const {
+    profile_phase_stats stats;
+    stats.rows = prefill_stats.rows + decode_stats.rows;
+    stats.required = prefill_stats.required + decode_stats.required;
+    stats.hits = prefill_stats.hits + decode_stats.hits;
+    stats.misses = prefill_stats.misses + decode_stats.misses;
+    stats.ssd_bytes = prefill_stats.ssd_bytes + decode_stats.ssd_bytes;
+    stats.ssd_reads = prefill_stats.ssd_reads + decode_stats.ssd_reads;
+    stats.ssd_read_us = prefill_stats.ssd_read_us + decode_stats.ssd_read_us;
+    stats.h2d_us = prefill_stats.h2d_us + decode_stats.h2d_us;
+    stats.compute_us = prefill_stats.compute_us + decode_stats.compute_us;
+    stats.stall_us = prefill_stats.stall_us + decode_stats.stall_us;
+    stats.cache_resident_peak = prefill_stats.cache_resident_peak > decode_stats.cache_resident_peak
+        ? prefill_stats.cache_resident_peak
+        : decode_stats.cache_resident_peak;
+    return stats;
 }
 
 void profiler::write_header() {

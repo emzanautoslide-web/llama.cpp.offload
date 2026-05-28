@@ -1,6 +1,7 @@
 #pragma once
 
 #include "loader.h"
+#include "profiler.h"
 
 #include <cstdint>
 #include <string>
@@ -9,8 +10,6 @@ struct ggml_context;
 struct ggml_tensor;
 
 namespace llama_moe {
-
-class profiler;  // forward decl
 
 struct runtime_options {
     bool enabled = false;
@@ -35,6 +34,8 @@ void end_request();
 // Phase E: access the global profiler for recording per-layer rows from
 // the eval-callback. Returns nullptr if profiling is not enabled.
 profiler * get_profiler();
+
+LLAMA_API profile_snapshot get_profile_snapshot();
 
 ggml_tensor * remap_selected_experts(
         ggml_context * ctx,

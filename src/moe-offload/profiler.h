@@ -17,8 +17,29 @@ struct profile_row {
     int64_t h2d_us = 0;
     int64_t compute_us = 0;
     int64_t stall_us = 0;
+    uint64_t ssd_bytes = 0;
+    uint64_t ssd_reads = 0;
     int cache_resident_experts = 0;
     std::string predictor = "lru";
+};
+
+struct profile_phase_stats {
+    uint64_t rows = 0;
+    uint64_t required = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t ssd_bytes = 0;
+    uint64_t ssd_reads = 0;
+    int64_t ssd_read_us = 0;
+    int64_t h2d_us = 0;
+    int64_t compute_us = 0;
+    int64_t stall_us = 0;
+    int cache_resident_peak = 0;
+};
+
+struct profile_snapshot {
+    profile_phase_stats prefill;
+    profile_phase_stats decode;
 };
 
 class profiler {
@@ -29,20 +50,17 @@ public:
 
     bool open(const std::string & csv_path);
     void record(const profile_row & row);
+    void flush();
+    profile_snapshot snapshot() const;
     std::string summary() const;
 
 private:
     void write_header();
+    profile_phase_stats total() const;
 
     std::ofstream csv;
-    uint64_t rows = 0;
-    uint64_t required = 0;
-    uint64_t hits = 0;
-    uint64_t misses = 0;
-    int64_t ssd_read_us = 0;
-    int64_t h2d_us = 0;
-    int64_t compute_us = 0;
-    int64_t stall_us = 0;
+    profile_phase_stats prefill_stats;
+    profile_phase_stats decode_stats;
 };
 
 } // namespace llama_moe

@@ -13,6 +13,7 @@
 #include "llama-impl.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -81,8 +82,8 @@ struct slot_pool_state {
 
     // Phase E: predictor
     std::unique_ptr<predictor> pred;
-    int64_t token_idx = 0;       // incremented per decode step
-    int64_t prefill_tokens = 0;  // captured on first decode
+    uint64_t token_idx = 0;
+    uint64_t current_token_idx = 0;
 };
 
 slot_pool_state & state() {
@@ -156,7 +157,7 @@ void configure_slot_pool() {
     s.cache_misses = 0;
     s.topk_calls = 0;
     s.token_idx = 0;
-    s.prefill_tokens = 0;
+    s.current_token_idx = 0;
 
     // Phase E: init predictor from runtime options
     const runtime_options & opts = get_options();
@@ -568,10 +569,23 @@ bool streaming_mode() {
 
 namespace {
 
+struct load_stats {
+    int64_t ssd_read_us = 0;
+    int64_t h2d_us = 0;
+    uint64_t ssd_bytes = 0;
+    uint64_t ssd_reads = 0;
+};
+
+static int64_t elapsed_us(std::chrono::steady_clock::time_point start,
+                          std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
 // Load one expert's three blobs (gate, up, down) from disk into the chosen
 // slot index. Caller holds s.mutex.
 bool load_expert_into_slot(slot_pool_state & s, const manifest & mf,
-                           uint32_t logical_layer, int32_t expert, int32_t slot) {
+                           uint32_t logical_layer, int32_t expert, int32_t slot,
+                           load_stats * stats = nullptr) {
     if (!s.io_fp) {
         s.io_fp = fopen(mf.source_path.c_str(), "rb");
         if (!s.io_fp) {
@@ -584,15 +598,22 @@ bool load_expert_into_slot(slot_pool_state & s, const manifest & mf,
         if (!slot_tensor) continue;
         const expert_record & rec = mf.at(logical_layer, (uint32_t) expert, (expert_kind) k);
         if (s.io_scratch.size() < rec.size) s.io_scratch.resize(rec.size);
+        const auto read_start = std::chrono::steady_clock::now();
         if (moe_fseek(s.io_fp, (long long)(mf.data_offset + rec.rel_offset), SEEK_SET) != 0) {
             LLAMA_LOG_ERROR("moe_eval_callback: seek failed L%u e%d k%d\n", logical_layer, expert, k);
             return false;
         }
         size_t got = fread(s.io_scratch.data(), 1, rec.size, s.io_fp);
+        const auto read_end = std::chrono::steady_clock::now();
         if (got != rec.size) {
             LLAMA_LOG_ERROR("moe_eval_callback: short read L%u e%d k%d got=%zu want=%zu\n",
                     logical_layer, expert, k, got, (size_t) rec.size);
             return false;
+        }
+        if (stats) {
+            stats->ssd_read_us += elapsed_us(read_start, read_end);
+            stats->ssd_bytes += rec.size;
+            ++stats->ssd_reads;
         }
         const size_t stride = slot_tensor->nb[2];
         if (rec.size > stride) {
@@ -618,7 +639,12 @@ bool load_expert_into_slot(slot_pool_state & s, const manifest & mf,
                     (unsigned long long) rec.size, stride, write_off, tensor_off, buf_size, bname, slot_tensor->data);
             fflush(stderr);
         }
+        const auto h2d_start = std::chrono::steady_clock::now();
         ggml_backend_tensor_set(slot_tensor, s.io_scratch.data(), write_off, rec.size);
+        const auto h2d_end = std::chrono::steady_clock::now();
+        if (stats) {
+            stats->h2d_us += elapsed_us(h2d_start, h2d_end);
+        }
     }
     return true;
 }
@@ -662,14 +688,11 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     std::vector<int32_t> ids((size_t) n_elem);
     ggml_backend_tensor_get(t, ids.data(), 0, ids.size() * sizeof(int32_t));
 
-    // Phase E: track prefill vs decode. On the first callback, if n_tokens > 1
-    // this is the prefill; subsequent calls are decode steps.
-    if (s.prefill_tokens == 0 && n_tokens > 1) {
-        s.prefill_tokens = n_tokens;
-        s.token_idx = 0;
-    } else if (s.prefill_tokens > 0) {
-        ++s.token_idx;
+    const char * phase = n_tokens > 1 ? "prefill" : "decode";
+    if (logical == 0) {
+        s.current_token_idx = s.token_idx;
     }
+    const uint64_t row_token_idx = s.current_token_idx;
 
     // Collect unique experts.
     std::unordered_set<int32_t> uniq;
@@ -711,13 +734,8 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
-    // Phase D-5: for misses, submit async fread via the worker thread.
-    // The worker reads expert blobs into staging buffers. After all reads
-    // complete, we do the H2D synchronously via ggml_backend_tensor_set.
-    // Overlap benefit: SSD reads of N experts proceed concurrently in the
-    // worker thread while the main thread is free (though currently blocked
-    // on io_wait_all).
-    int misses_submitted = 0;
+    load_stats layer_load_stats;
+    int misses_loaded = 0;
     for (int32_t e : uniq) {
         if (lc.exp2slot.count(e)) continue;
 
@@ -742,63 +760,15 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             lc.slot_to_expert[slot] = -1;
         }
 
-        // Submit one read request per expert kind (gate, up, down).
-        for (int k = 0; k < EXPERT_KIND_COUNT; ++k) {
-            ggml_tensor * slot_tensor = get_slot_tensor(logical, (expert_kind) k);
-            if (!slot_tensor || !slot_tensor->data) continue;
-
-            const expert_record & rec = mf.at((uint32_t) logical, e, (expert_kind) k);
-            if (rec.size == 0) continue;
-
-            void * buf = io_acquire_buffer();
-            if (!buf) {
-                // Pool exhausted; fall back to sync load.
-                load_expert_into_slot(s, mf, (uint32_t) logical, e, slot);
-                break;
-            }
-
-            io_request req;
-            req.layer       = logical;
-            req.expert      = e;
-            req.kind        = k;
-            req.slot        = slot;
-            req.pinned_buf  = buf;
-            req.blob_size   = rec.size;
-            req.file_offset = mf.data_offset + rec.rel_offset;
-            req.gpu_dst     = (char *) slot_tensor->data + (size_t) slot * slot_tensor->nb[2];
-
-            if (!io_submit(req)) {
-                io_release_buffer(buf);
-                load_expert_into_slot(s, mf, (uint32_t) logical, e, slot);
-                break;
-            }
+        if (!load_expert_into_slot(s, mf, (uint32_t) logical, e, slot, &layer_load_stats)) {
+            GGML_ABORT("MoE-offload: failed to load expert into slot");
         }
 
         lc.slot_to_expert[slot] = e;
         lc.exp2slot[e] = slot;
         lru_touch(lc, e);
         ++s.cache_misses;
-        ++misses_submitted;
-    }
-
-    // Wait for all async freads to complete, then do H2D for each.
-    if (misses_submitted > 0) {
-        io_wait_all();
-
-        // Now do the H2D synchronously for each completed read.
-        // The io_request structs are drained by io_wait_all internally;
-        // we track buffers in the slot_pool state.
-        // For simplicity, the H2D is done via ggml_backend_tensor_set
-        // using the staging buffers already filled by the worker.
-        // Since we can't retrieve completed requests from io_wait_all's
-        // return value (design simplification), we fall back to using the
-        // sync load_expert_into_slot path for the actual H2D.
-        //
-        // FIXME(D-5): store completed requests so we can do H2D from the
-        // staging buffers without re-reading from disk.
-        // For now, the async path provides limited benefit (only I/O overlap
-        // with other CPU work). A full implementation would need request
-        // tracking to map completed reads back to their slot tensors.
+        ++misses_loaded;
     }
 
     // Strategy (D-4): build slot_table host buffer (init 0, set hot entries).
@@ -838,17 +808,26 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     {
         int k_req = (int) uniq.size();
         profile_row row;
-        row.token_idx = (uint64_t) s.token_idx;
-        row.phase = (s.prefill_tokens > 0) ? "decode" : "prefill";
+        row.token_idx = row_token_idx;
+        row.phase = phase;
         row.layer = logical;
         row.k_required = k_req;
-        row.k_hit = k_req - misses_submitted;
-        row.k_miss = misses_submitted;
+        row.k_hit = k_req - misses_loaded;
+        row.k_miss = misses_loaded;
+        row.ssd_read_us = layer_load_stats.ssd_read_us;
+        row.h2d_us = layer_load_stats.h2d_us;
+        row.stall_us = layer_load_stats.ssd_read_us + layer_load_stats.h2d_us;
+        row.ssd_bytes = layer_load_stats.ssd_bytes;
+        row.ssd_reads = layer_load_stats.ssd_reads;
         row.cache_resident_experts = (int) lc.exp2slot.size();
         row.predictor = s.pred->name();
         if (profiler * p = get_profiler()) {
             p->record(row);
         }
+    }
+
+    if ((uint32_t) logical + 1 == mf.n_layers) {
+        s.token_idx += n_tokens > 0 ? (uint64_t) n_tokens : 1;
     }
 
     if (s.topk_calls % 200 == 0) {
