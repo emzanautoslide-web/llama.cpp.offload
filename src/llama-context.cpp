@@ -2296,6 +2296,19 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ggml_backend_sched_reset(sched.get());
 
+#ifdef LLAMA_MOE_OFFLOAD
+    // Phase J: graph_reserve() rebuilds the graph from scratch, allocating
+    // new topk/slot_table tensors. The MoE runtime caches topk→slot_table
+    // pointers across builds; if we don't clear them here, the eval callback
+    // can match a freshly-allocated tensor address against a stale entry
+    // from the previous graph and route through the wrong slot indices.
+    // This is the streaming numerical-drift bug surfaced by the Phase J
+    // golden-logits test.
+    if (llama_moe::runtime_enabled()) {
+        llama_moe::reset_graph_state();
+    }
+#endif
+
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
 

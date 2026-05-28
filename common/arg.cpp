@@ -2331,6 +2331,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
 #endif
     add_opt(common_arg(
+        {"--logit-dump"}, "PATH",
+        "dump per-decode logits as raw float32 rows to PATH (binary; "
+        "16-byte header \"LLMLOGV1\" + int32 n_vocab + int32 reserved)",
+        [](common_params & params, const std::string & value) {
+            params.logit_dump_path = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
         string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),

@@ -115,6 +115,71 @@ Implemented in this slice:
 - **E**: Per-layer CSV profiling rows; snapshot summary; LRU/EAMC predictor wired into eval-callback eviction.
 - **F**: `llama-moe-bench` emits the §4.7-style stdout/file summary and writes nonempty CSV rows when requested.
 
+## Correctness
+
+Streaming numerical correctness is gated by a per-decode logit dump and a
+full-residency vs. streaming comparison. The harness lives at
+`tests/moe-offload/test-golden-logits.ps1` and is *not* registered with
+CTest (the reference model is multi-GB).
+
+How to run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\moe-offload\test-golden-logits.ps1 `
+    -Tol 1e-3 -NPredict 8 -StreamCacheMb 12000
+```
+
+The harness runs `llama-completion --logit-dump` twice on the same model
+and seed: once at `--moe-cache-vram-mb 99999` (full residency, reference)
+and once at `--moe-cache-vram-mb 12000` (streaming, n_slots=145 vs.
+n_experts=256 — forces eviction every layer). `tests/moe-offload/compare_logits.py`
+then mmaps both binary dumps and reports `max|Δlogit|` / `mean|Δlogit|`.
+Exit 0 iff `max|Δlogit| < --tol`.
+
+Observed on the dev box (2026-05-28, Qwen3.5-35B-A3B-Q4_K_M, prompt
+`"Hello"`, `--temp 0 --seed 42 -n 8`, 12000 MiB streaming cache,
+n_slots=145, hits=630 misses=970):
+
+| Metric | Value |
+|---|---|
+| `n_steps` | 8 |
+| `n_vocab` | 248320 |
+| `max|Δlogit|` | **4.64e-01** |
+| `mean|Δlogit|` | 3.67e-02 |
+| `tol` | 1e-3 |
+| Result | **FAIL** (drift first observed at step 3) |
+
+The drift is real — the gate is doing its job. Streaming-mode top-1 tokens
+still match full-residency for the first 8 decodes at temp=0 (per Phase H/I
+text-equivalence smoke), but the full softmax row is not bit-equivalent.
+Root cause is not yet pinned down; Phase J anticipated a stale
+`topk → slot_table` registration on a rebuild path
+(`reset_graph_state()` now also fires in `llama_context::graph_reserve()`),
+but that alone did not move the measured drift. Remaining hypotheses:
+
+- A slot whose contents are replaced between the eval callback finishing
+  H2D and the mul_mat_id consuming the row (eviction/wait ordering bug
+  in `slot_pool::moe_eval_callback`).
+- An expert whose slot_table entry is set by a later layer's callback
+  before the current layer's mul_mat_id runs (callback ordering vs.
+  scheduler topology).
+
+Tracking this drift to zero is on the Phase L / post-MVP hygiene list.
+
+Deviations from the source plan (`implementation_plan_mvp_20260529.md` §3):
+
+- `--moe-cache-vram-mb 4000` deadlocks on this dev box (n_slots=48 falls
+  below the n_ubatch×topk=64 lower bound and the slot pool stalls before
+  generation starts). The harness defaults to 12000 MiB, which still
+  forces ~60% misses and remains a representative streaming workload.
+- The plan called for prompt `"The quick brown fox"`. On this dev box
+  any prompt longer than ~2 tokens hangs `llama-completion` during
+  prefill in streaming mode (no diagnostic output beyond
+  `generate: n_predict=...`). The harness defaults to `"Hello"` to keep
+  the gate runnable; the same prompt-length sensitivity is reproducible
+  without `--logit-dump`, so the gate itself is not the cause. Both
+  deadlocks are filed against Phase L.
+
 ## Troubleshooting
 
 ### "n_uniq exceeds n_slots" error

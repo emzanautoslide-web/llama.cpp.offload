@@ -567,6 +567,10 @@ struct common_params {
     bool        moe_oracle             = false;
 #endif
 
+    // diagnostic: dump per-decode logits as raw float32 rows to this path
+    // (binary; 16-byte header "LLMLOGV1" + int32 n_vocab + int32 reserved)
+    std::string logit_dump_path        = "";
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

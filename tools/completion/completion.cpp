@@ -159,6 +159,26 @@ int llama_completion(int argc, char ** argv) {
     llama_memory_t mem = llama_get_memory(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
+    // Phase J: per-decode logits dump (binary, raw float32).
+    // Header: 8 bytes magic "LLMLOGV1" + int32 n_vocab + int32 reserved.
+    FILE * logit_dump_fp = nullptr;
+    int32_t logit_dump_n_vocab = 0;
+    if (!params.logit_dump_path.empty()) {
+        logit_dump_fp = std::fopen(params.logit_dump_path.c_str(), "wb");
+        if (!logit_dump_fp) {
+            LOG_ERR("%s: failed to open --logit-dump path '%s'\n", __func__, params.logit_dump_path.c_str());
+            return 1;
+        }
+        logit_dump_n_vocab = (int32_t) llama_vocab_n_tokens(vocab);
+        const char magic[8] = { 'L','L','M','L','O','G','V','1' };
+        const int32_t reserved = 0;
+        std::fwrite(magic, 1, sizeof(magic), logit_dump_fp);
+        std::fwrite(&logit_dump_n_vocab, sizeof(int32_t), 1, logit_dump_fp);
+        std::fwrite(&reserved, sizeof(int32_t), 1, logit_dump_fp);
+        LOG_INF("%s: logit-dump enabled, path='%s' n_vocab=%d\n",
+                __func__, params.logit_dump_path.c_str(), (int) logit_dump_n_vocab);
+    }
+
     // note: the time for chat template initialization is not negligible:
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
 
@@ -715,6 +735,16 @@ int llama_completion(int argc, char ** argv) {
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
 
+            // Phase J: dump pre-sampling logits for the last position before
+            // we mutate sampler state. Only for generated tokens (this branch).
+            if (logit_dump_fp) {
+                const float * lg = llama_get_logits_ith(ctx, -1);
+                if (lg) {
+                    std::fwrite(lg, sizeof(float), (size_t) logit_dump_n_vocab, logit_dump_fp);
+                    std::fflush(logit_dump_fp);
+                }
+            }
+
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
@@ -996,6 +1026,12 @@ int llama_completion(int argc, char ** argv) {
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);
+
+    if (logit_dump_fp) {
+        std::fflush(logit_dump_fp);
+        std::fclose(logit_dump_fp);
+        logit_dump_fp = nullptr;
+    }
 
     llama_backend_free();
 
