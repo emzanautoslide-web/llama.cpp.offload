@@ -1,5 +1,7 @@
 #include "io.h"
 
+#include "ggml-backend.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -209,5 +211,48 @@ int io_wait_all() {
 int io_outstanding() {
     return g_worker.outstanding.load(std::memory_order_relaxed);
 }
+
+// ---------------------------------------------------------------------------
+// CUDA-backed pinned staging / async H2D / event helpers (Phase G).
+//
+// When the build links against the ggml-cuda backend (GGML_USE_CUDA is
+// defined for ggml.dll consumers), forward to the extern "C" symbols
+// implemented in `ggml/src/ggml-cuda/moe_offload_io.cu`. Otherwise compile
+// no-op stubs so callers can probe at runtime via the nullptr/false return.
+// ---------------------------------------------------------------------------
+
+#if defined(GGML_USE_CUDA)
+
+extern "C" {
+    GGML_BACKEND_API void * moe_io_cuda_pinned_alloc (size_t bytes);
+    GGML_BACKEND_API void   moe_io_cuda_pinned_free  (void * p);
+    GGML_BACKEND_API bool   moe_io_cuda_h2d_async    (void * dst_dev, const void * src_pinned,
+                                                      size_t bytes, void ** out_ev);
+    GGML_BACKEND_API void   moe_io_cuda_event_release(void * ev);
+    GGML_BACKEND_API bool   moe_io_cuda_compute_wait (ggml_backend_t backend, void * ev);
+    GGML_BACKEND_API bool   moe_io_cuda_event_sync   (void * ev);
+    GGML_BACKEND_API size_t moe_io_cuda_events_in_use(void);
+}
+
+void * io_pinned_alloc(size_t bytes)                       { return moe_io_cuda_pinned_alloc(bytes); }
+void   io_pinned_free (void * p)                           { moe_io_cuda_pinned_free(p); }
+bool   io_h2d_async   (void * d, const void * s, size_t n,
+                       void ** out_ev)                     { return moe_io_cuda_h2d_async(d, s, n, out_ev); }
+void   io_event_release(void * ev)                         { moe_io_cuda_event_release(ev); }
+bool   io_compute_wait(ggml_backend_t b, void * ev)        { return moe_io_cuda_compute_wait(b, ev); }
+bool   io_event_sync  (void * ev)                          { return moe_io_cuda_event_sync(ev); }
+size_t io_events_in_use()                                  { return moe_io_cuda_events_in_use(); }
+
+#else // !GGML_USE_CUDA — stubs for CPU-only build
+
+void * io_pinned_alloc(size_t)                             { return nullptr; }
+void   io_pinned_free (void *)                             { }
+bool   io_h2d_async   (void *, const void *, size_t, void **) { return false; }
+void   io_event_release(void *)                            { }
+bool   io_compute_wait(ggml_backend_t, void *)             { return false; }
+bool   io_event_sync  (void *)                             { return false; }
+size_t io_events_in_use()                                  { return 0; }
+
+#endif // GGML_USE_CUDA
 
 } // namespace llama_moe

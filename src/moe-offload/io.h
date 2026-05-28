@@ -1,7 +1,14 @@
 #pragma once
 
+#include "llama.h"
+
 #include <cstdint>
 #include <cstddef>
+
+// Forward declaration of the ggml backend handle so we don't pull
+// ggml-backend.h into every translation unit that includes this header.
+struct ggml_backend;
+typedef struct ggml_backend * ggml_backend_t;
 
 namespace llama_moe {
 
@@ -60,5 +67,43 @@ int io_wait_all();
 
 // Number of outstanding (submitted but not yet waited) requests.
 int io_outstanding();
+
+// ---------------------------------------------------------------------------
+// CUDA-backed pinned staging + async H2D + event plumbing (Phase G).
+//
+// These thin wrappers forward to symbols defined in
+// `ggml/src/ggml-cuda/moe_offload_io.cu` when the build has CUDA enabled.
+// On a CPU-only build they all return null/false; callers fall back to
+// plain malloc + synchronous ggml_backend_tensor_set.
+//
+// Events are returned as opaque `void *` so this header does not depend on
+// <cuda_runtime.h>.
+// ---------------------------------------------------------------------------
+
+// Allocate `bytes` of pinned host memory. Returns nullptr on failure or on a
+// CPU-only build.
+LLAMA_API void * io_pinned_alloc(size_t bytes);
+
+// Free memory previously returned by io_pinned_alloc.
+LLAMA_API void io_pinned_free(void * p);
+
+// Queue an async host->device copy on the dedicated MoE H2D stream and
+// record an event when it completes. *out_ev is set to an opaque handle.
+// Returns false on error or if CUDA is unavailable.
+LLAMA_API bool io_h2d_async(void * dst_dev, const void * src_pinned, size_t bytes, void ** out_ev);
+
+// Return an opaque event handle back to the internal pool.
+LLAMA_API void io_event_release(void * ev);
+
+// Make the given CUDA backend's compute stream wait until *ev signals.
+// Returns false if `backend` is not a CUDA backend or CUDA is unavailable.
+LLAMA_API bool io_compute_wait(ggml_backend_t backend, void * ev);
+
+// Block the calling thread until *ev signals (test/diagnostic helper).
+// Returns false if CUDA is unavailable.
+LLAMA_API bool io_event_sync(void * ev);
+
+// Diagnostic: number of events currently held by callers (not in the pool).
+LLAMA_API size_t io_events_in_use();
 
 } // namespace llama_moe

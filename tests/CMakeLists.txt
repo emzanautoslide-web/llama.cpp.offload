@@ -308,3 +308,15 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# ---------------------------------------------------------------------------
+# MoE offload tests (Phase G+ of implementation_plan_mvp_20260529.md)
+# ---------------------------------------------------------------------------
+if (LLAMA_MOE_OFFLOAD)
+    llama_build_and_test(moe-offload/test-cuda-stream.cpp LABEL "moe-offload")
+    target_include_directories(test-cuda-stream PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    find_package(CUDAToolkit QUIET)
+    if (TARGET CUDA::cudart)
+        target_link_libraries(test-cuda-stream PRIVATE CUDA::cudart)
+    endif()
+endif()
