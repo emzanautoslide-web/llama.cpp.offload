@@ -38,6 +38,13 @@ struct slot_pool_state {
     uint32_t n_slots = 0;
     // slot_tensors[logical_layer][kind] -> tensor
     std::vector<std::array<ggml_tensor *, EXPERT_KIND_COUNT>> slot_tensors;
+    // Phase D-4: per-logical-layer slot_table tensor [1, n_expert] I32,
+    // pre-allocated on the same backend buffer as the slot weight tensors
+    // (via `ml.create_unfiled_tensor`). Persistent storage means the
+    // scheduler does NOT recycle the buffer for graph temporaries, so the
+    // eval-callback's mid-graph `ggml_backend_tensor_set` is read correctly
+    // by the immediately-following `ggml_get_rows` consumer.
+    std::vector<ggml_tensor *> slot_table_tensors;
     // Phase D-1/D-2: per-(topk tensor) slot_table input tensor. Because the
     // compute graph can be rebuilt multiple times (graph_reserve passes,
     // different ubatch shapes) we record the (topk -> slot_table) association
@@ -126,6 +133,7 @@ void configure_slot_pool() {
 
     s.n_slots = compute_n_slots(get_options(), mf);
     s.slot_tensors.assign(mf.n_layers, std::array<ggml_tensor *, EXPERT_KIND_COUNT>{nullptr, nullptr, nullptr});
+    s.slot_table_tensors.assign(mf.n_layers, nullptr);
     s.topk_to_slot_table.clear();
     s.topk_to_logical.clear();
     s.all_slot_tables.clear();
@@ -151,6 +159,7 @@ void reset_slot_pool() {
     s.configured = false;
     s.n_slots = 0;
     s.slot_tensors.clear();
+    s.slot_table_tensors.clear();
     s.topk_to_slot_table.clear();
     s.topk_to_logical.clear();
     s.all_slot_tables.clear();
@@ -209,6 +218,13 @@ ggml_tensor * intercept_expert_tensor(
         return nullptr;
     }
 
+    static int intercept_cnt = 0;
+    if (intercept_cnt < 4) {
+        fprintf(stderr, "[moe-d4] intercept_expert_tensor ENTER #%d L%d k%d tn=%s\n",
+                intercept_cnt, logical_layer, (int)kind, tn.str().c_str());
+    }
+    ++intercept_cnt;
+
     const std::string src_name = tn.str();
     ggml_tensor * src_meta = ml.get_tensor_meta(src_name.c_str());
     if (!src_meta) {
@@ -229,14 +245,35 @@ ggml_tensor * intercept_expert_tensor(
     const int64_t d_in  = ne.begin()[0];
     const int64_t d_out = ne.begin()[1];
 
+    // Always allocate the slot tensor with the original expert count (n_expert)
+    // as ne[2]. The mmq kernel used by mul_mat_id can crash with non-standard
+    // expert counts. The cache still manages only n_slots experts;
+    // unused slots [n_slots, n_expert-1] are never accessed because the
+    // remap maps expert IDs strictly into [0, n_slots-1].
+    const int64_t n_expert = ne.begin()[2];
+    (void) n_slots; // usable cache size; expert axis must stay at n_expert for mmq
+
     const std::string slot_name = src_name + ".slot";
 
     ggml_tensor * slot = ml.create_unfiled_tensor(
             hparams, buft_list_layer, slot_name, src_meta->type,
-            GGML_OP_MUL_MAT_ID, { d_in, d_out, (int64_t) n_slots });
+            GGML_OP_MUL_MAT_ID, { d_in, d_out, n_expert });
 
     if (!slot) {
         throw std::runtime_error("intercept_expert_tensor: create_unfiled_tensor returned null");
+    }
+
+    // D-4 DEBUG: verify slot tensor strides match source metadata strides
+    if (logical_layer == 0 && kind == EXPERT_GATE) {
+        fprintf(stderr, "[moe-d4] slot tensor %s: type=%s ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu]\n",
+                slot_name.c_str(), ggml_type_name(slot->type),
+                (long long)slot->ne[0], (long long)slot->ne[1], (long long)slot->ne[2],
+                slot->nb[0], slot->nb[1], slot->nb[2]);
+        // Also dump source meta for comparison
+        fprintf(stderr, "[moe-d4] src_meta %s: type=%s ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu]\n",
+                src_name.c_str(), ggml_type_name(src_meta->type),
+                (long long)src_meta->ne[0], (long long)src_meta->ne[1], (long long)src_meta->ne[2],
+                src_meta->nb[0], src_meta->nb[1], src_meta->nb[2]);
     }
 
     // The original GGUF weight is no longer materialized via the loader; account for it.
@@ -246,6 +283,38 @@ ggml_tensor * intercept_expert_tensor(
     std::lock_guard<std::mutex> lock(s.mutex);
     if (logical_layer >= 0 && (size_t) logical_layer < s.slot_tensors.size()) {
         s.slot_tensors[logical_layer][kind] = slot;
+    }
+
+    // Create the per-layer slot_table tensor on the FIRST kind we see for this
+    // layer. Shape [1, n_expert] I32 — same backend buffer as the slot weights.
+    {
+        size_t stvsz = s.slot_table_tensors.size();
+        if (logical_layer >= 0 && (size_t) logical_layer < stvsz &&
+            s.slot_table_tensors[logical_layer] == nullptr) {
+            const int64_t n_expert = (int64_t) get_manifest().n_experts_per_layer;
+            char st_name[64];
+            std::snprintf(st_name, sizeof(st_name), "moe.slot_table.%d", logical_layer);
+            ggml_tensor * stt = ml.create_unfiled_tensor(
+                    hparams, buft_list_layer, st_name, GGML_TYPE_I32,
+                    GGML_OP_GET_ROWS, { (int64_t) 1, n_expert });
+            if (stt) {
+                s.slot_table_tensors[logical_layer] = stt;
+                fprintf(stderr, "[moe-d4] created %s L%d ne=[%lld,%lld] buf=%s has_buf=%d\n",
+                        st_name, logical_layer,
+                        (long long) stt->ne[0], (long long) stt->ne[1],
+                        stt->buffer ? ggml_backend_buffer_name(stt->buffer) : "NULL",
+                        stt->buffer ? 1 : 0);
+            } else {
+                fprintf(stderr, "[moe-d4] FAILED create_unfiled_tensor for %s L%d\n",
+                        st_name, logical_layer);
+            }
+        } else if (logical_layer >= 0) {
+            if ((size_t) logical_layer >= stvsz) {
+                fprintf(stderr, "[moe-d4] slot_table_tensors OOB: L%d >= size=%zu\n",
+                        logical_layer, stvsz);
+            }
+            // else: already created for this layer, silent skip
+        }
     }
 
     static bool logged_first = false;
@@ -267,8 +336,19 @@ ggml_tensor * get_slot_tensor(int logical_layer, expert_kind kind) {
     return s.slot_tensors[logical_layer][(int) kind];
 }
 
+ggml_tensor * get_slot_table_tensor(int logical_layer) {
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (logical_layer < 0 || (size_t) logical_layer >= s.slot_table_tensors.size()) {
+        return nullptr;
+    }
+    return s.slot_table_tensors[logical_layer];
+}
+
 bool prefetch_all_experts() {
+    fprintf(stderr, "[moe-d4] prefetch_all_experts ENTER\n");
     if (!runtime_enabled()) {
+        fprintf(stderr, "[moe-d4] prefetch_all_experts: runtime disabled, skip\n");
         return true;
     }
     const manifest & mf = get_manifest();
@@ -280,9 +360,44 @@ bool prefetch_all_experts() {
     if (n_slots == 0) {
         return true;
     }
+
+    // D-4: Zero-initialize all slot tensor buffers so that unused / excess
+    // slots contain valid zero data instead of GPU garbage. The mmq kernel
+    // (used by mul_mat_id) can access these slots when processing large
+    // batches, and garbage data causes illegal memory accesses during
+    // weight quantization (confirmed via compute-sanitizer). Zeroed slots
+    // produce valid all-zero Q4_K blocks which the kernel handles safely.
+    {
+        const int64_t t_z = ggml_time_us();
+        size_t n_zeroed = 0;
+        ggml_tensor * last_slot = nullptr;
+        fprintf(stderr, "[moe-d4] prefetch_all_experts: starting zero-init of slot tensors...\n");
+        for (uint32_t li = 0; li < mf.n_layers; ++li) {
+            for (int k = 0; k < EXPERT_KIND_COUNT; ++k) {
+                ggml_tensor * slot = get_slot_tensor((int) li, (expert_kind) k);
+                if (!slot || !slot->buffer) {
+                    continue;
+                }
+                ggml_backend_tensor_memset(slot, 0, 0, ggml_nbytes(slot));
+                last_slot = slot;
+                ++n_zeroed;
+            }
+        }
+        // The CUDA backend's memset_tensor uses cudaMemsetAsync on
+        // cudaStreamPerThread WITHOUT syncing.  Force a sync by doing a
+        // tiny tensor_set (which calls cudaStreamSynchronize) so that
+        // subsequent compute-stream kernels see the zeroed data.
+        if (last_slot) {
+            uint8_t dummy = 0;
+            ggml_backend_tensor_set(last_slot, &dummy, 0, 1);
+        }
+        fprintf(stderr, "[moe-d4] prefetch_all_experts: zeroed %zu slot tensors in %.2f ms (incl sync)\n",
+                n_zeroed, (ggml_time_us() - t_z) / 1000.0);
+    }
+
     if (n_slots < mf.n_experts_per_layer) {
-        LLAMA_LOG_INFO("%s: skipping prefetch (n_slots=%u < n_experts=%u; eval-callback streaming mode)\n",
-                __func__, n_slots, mf.n_experts_per_layer);
+        fprintf(stderr, "[moe-d4] prefetch_all_experts: skipping prefetch (n_slots=%u < n_experts=%u; streaming mode)\n",
+                n_slots, mf.n_experts_per_layer);
         return true;
     }
 
@@ -362,11 +477,20 @@ void register_slot_table_for_topk(int logical_layer, ggml_tensor * topk, ggml_te
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.configured || !topk || !slot_table) {
+        fprintf(stderr, "[moe-d4] register_slot_table_for_topk SKIP: cfg=%d topk=%p st=%p L=%d\n",
+                s.configured ? 1 : 0, (void*)topk, (void*)slot_table, logical_layer);
         return;
     }
     s.topk_to_slot_table[topk]   = slot_table;
     s.topk_to_logical[topk]      = logical_layer;
     s.all_slot_tables.push_back(slot_table);
+    static int reg_cnt = 0;
+    if (reg_cnt < 4) {
+        fprintf(stderr, "[moe-d4] register_slot_table_for_topk #%d L=%d topk=%p st=%p st->buf=%s\n",
+                reg_cnt, logical_layer, (void*)topk, (void*)slot_table,
+                slot_table->buffer ? ggml_backend_buffer_name(slot_table->buffer) : "NULL");
+    }
+    ++reg_cnt;
 }
 
 void reset_graph_state() {
@@ -466,12 +590,15 @@ bool load_expert_into_slot(slot_pool_state & s, const manifest & mf,
                     tensor_off, write_off, (unsigned long long) rec.size, buf_size, logical_layer, expert, k, slot);
             return false;
         }
+        // D-3: dump all loads (capped) so we can verify slot_off math at slots beyond ~16.
         static int dump = 0;
-        if (dump < 6) {
+        if (dump < 3000) {
             ++dump;
-            LLAMA_LOG_INFO("load_expert dump: L%u e%d k%d slot=%d rec.size=%llu stride=%zu tensor_off=%zu buf_size=%zu data=%p\n",
-                    logical_layer, expert, k, slot,
-                    (unsigned long long) rec.size, stride, tensor_off, buf_size, slot_tensor->data);
+            const char * bname = slot_tensor->buffer ? ggml_backend_buffer_name(slot_tensor->buffer) : "<null>";
+            fprintf(stderr, "[moe-d3] load#%d L%u e%d k%d slot=%d rec.size=%llu stride=%zu write_off=%zu tensor_off=%zu buf_size=%zu buf=%s data=%p\n",
+                    dump, logical_layer, expert, k, slot,
+                    (unsigned long long) rec.size, stride, write_off, tensor_off, buf_size, bname, slot_tensor->data);
+            fflush(stderr);
         }
         ggml_backend_tensor_set(slot_tensor, s.io_scratch.data(), write_off, rec.size);
     }
@@ -574,86 +701,40 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         ++s.cache_misses;
     }
 
-    // Build slot_table host buffer. Only entries for selected experts matter.
-    // Initialize all to 0 (safe sentinel; will be overwritten for hot ones).
+    // Strategy (D-4): build slot_table host buffer (init 0, set hot entries).
     std::fill(s.slot_table_host.begin(), s.slot_table_host.end(), 0);
     for (int32_t e : uniq) {
         s.slot_table_host[(size_t) e] = lc.exp2slot[e];
     }
-    ggml_tensor * stt_ok = stt;
-    static bool first_call_logged = false;
-    if (!first_call_logged) {
-        first_call_logged = true;
-        const char * buf_name = (stt_ok && stt_ok->buffer) ? ggml_backend_buffer_name(stt_ok->buffer) : "<null>";
-        LLAMA_LOG_INFO("moe_eval_callback: FIRST CALL t=%p name=%s logical=%d stt=%p stt_buf=%p stt_buf_name=%s n_uniq=%zu n_slots=%u\n",
-                (void*)t, t->name, logical, (void*)stt_ok, stt_ok ? (void*)stt_ok->buffer : nullptr,
-                buf_name, uniq.size(), s.n_slots);
-        // also log first slot tensor buffer name to be sure
-        if (s.slot_tensors[logical][0]) {
-            const char * sn = s.slot_tensors[logical][0]->buffer ? ggml_backend_buffer_name(s.slot_tensors[logical][0]->buffer) : "<null>";
-            LLAMA_LOG_INFO("  slot_tensor[0] buf=%s nb2=%zu\n", sn, s.slot_tensors[logical][0]->nb[2]);
-        }
-        for (int32_t e : uniq) {
-            int32_t sl = lc.exp2slot.count(e) ? lc.exp2slot[e] : -1;
-            LLAMA_LOG_INFO("  expert %d -> slot %d\n", e, sl);
-        }
-    }
-    // Bounds check: ensure all written slot indices are valid.
-    {
-        static int bad_count = 0;
-        for (size_t i = 0; i < s.slot_table_host.size(); ++i) {
-            int32_t v = s.slot_table_host[i];
-            if (v < 0 || (uint32_t) v >= s.n_slots) {
-                if (bad_count < 10) {
-                    LLAMA_LOG_ERROR("moe_eval_callback: BAD slot %d at expert %zu (n_slots=%u) logical=%d topk=%llu\n",
-                            v, i, s.n_slots, logical, (unsigned long long) s.topk_calls);
-                    ++bad_count;
-                }
-                break;
-            }
-        }
-    }
-    // Per-layer first-call trace
-    static std::vector<bool> per_layer_logged;
-    if (per_layer_logged.size() != s.cache.size()) per_layer_logged.assign(s.cache.size(), false);
-    if (!per_layer_logged[logical]) {
-        per_layer_logged[logical] = true;
-        const char * buf_name = (stt_ok && stt_ok->buffer) ? ggml_backend_buffer_name(stt_ok->buffer) : "<null>";
-        LLAMA_LOG_INFO("moe_eval_callback: layer %d first call n_uniq=%zu stt_buf=%s misses=%llu\n",
-                logical, uniq.size(), buf_name, (unsigned long long) s.cache_misses);
-    }
-    // Per-call trace (first batch only)
-    static uint64_t call_counter = 0;
-    if (call_counter < 200) {
-        LLAMA_LOG_INFO("moe_eval_callback: call #%llu layer=%d n_uniq=%zu\n",
-                (unsigned long long) call_counter, logical, uniq.size());
-        ++call_counter;
-    }
-    if (stt_ok && stt_ok->buffer) {
-        ggml_backend_tensor_set(stt_ok, s.slot_table_host.data(), 0,
+
+    // Write slot_table to the persistent GPU-resident slot_table tensor. The
+    // tensor was pre-allocated by `intercept_expert_tensor` in the same buffer
+    // as the slot weight tensors, so its storage is never aliased by the
+    // scheduler's temporaries — the immediately-following `ggml_get_rows`
+    // consumer will read what we just wrote.
+    if (stt && stt->buffer) {
+        ggml_backend_tensor_set(stt, s.slot_table_host.data(), 0,
                                 s.slot_table_host.size() * sizeof(int32_t));
-        // Verify GPU write took effect by reading back (debug only, first layer)
-        if (logical == 0 && s.topk_calls == 0) {
-            std::vector<int32_t> back(s.slot_table_host.size());
-            ggml_backend_tensor_get(stt_ok, back.data(), 0, back.size() * sizeof(int32_t));
-            int mismatches = 0;
-            for (size_t i = 0; i < back.size(); ++i) {
-                if (back[i] != s.slot_table_host[i]) ++mismatches;
-            }
-            LLAMA_LOG_INFO("moe_eval_callback: GPU readback verify layer 0 mismatches=%d back[16]=%d back[160]=%d (sent 0 and 1)\n",
-                    mismatches, back[16], back[160]);
+        if (s.topk_calls < 8) {
+            // Log first few callbacks: buffer name, uniq count, first few entries
+            const char * bn = ggml_backend_buffer_name(stt->buffer);
+            size_t nz = 0;
+            for (auto v : s.slot_table_host) if (v != 0) ++nz;
+            fprintf(stderr, "[moe-d4] cb#%llu layer=%d uniq=%zu nz=%zu buf=%s stt=%p\n",
+                    (unsigned long long) s.topk_calls, logical,
+                    uniq.size(), nz, bn ? bn : "?", (void *) stt);
         }
     } else {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            LLAMA_LOG_ERROR("moe_eval_callback: stt has no buffer! stt=%p logical=%d\n",
-                    (void*)stt_ok, logical);
+            fprintf(stderr, "[moe-d4] moe_eval_callback: slot_table for layer %d has no buffer (stt=%p)\n",
+                    logical, (void *) stt);
         }
     }
     ++s.topk_calls;
     if (s.topk_calls % 200 == 0) {
-        LLAMA_LOG_INFO("moe_eval_callback: %llu topk calls, hits=%llu misses=%llu\n",
+        fprintf(stderr, "[moe-d4] moe_eval_callback: %llu topk calls, hits=%llu misses=%llu\n",
                 (unsigned long long) s.topk_calls,
                 (unsigned long long) s.cache_hits,
                 (unsigned long long) s.cache_misses);

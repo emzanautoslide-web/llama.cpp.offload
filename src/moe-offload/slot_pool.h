@@ -47,6 +47,12 @@ ggml_tensor * intercept_expert_tensor(
 // Look up a previously registered slot tensor.
 ggml_tensor * get_slot_tensor(int logical_layer, expert_kind kind);
 
+// Phase D-4: look up the per-layer slot_table tensor (shape [1, n_expert] I32)
+// pre-allocated by `intercept_expert_tensor`. Used as the source operand of
+// `ggml_get_rows` inside `remap_selected_experts` and written by the
+// eval-callback via `ggml_backend_tensor_set`.
+ggml_tensor * get_slot_table_tensor(int logical_layer);
+
 // Phase C: synchronously fill every slot tensor with its corresponding expert blob
 // from disk (one slot == one expert). Called after the loader has allocated backing
 // buffers via ggml_backend_alloc_ctx_tensors and finished load_all_data. Returns

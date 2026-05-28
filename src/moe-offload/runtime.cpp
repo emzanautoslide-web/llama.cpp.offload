@@ -95,35 +95,35 @@ ggml_tensor * remap_selected_experts(
         return selected_experts;
     }
 
-    // selected_experts: [n_expert_used, n_tokens] I32 (ne = [neu, nt, 1, 1])
     const int64_t neu = selected_experts->ne[0];
     const int64_t nt  = selected_experts->ne[1];
     if (neu != n_expert_used || nt <= 0) {
         return selected_experts;
     }
+    (void) n_expert;
 
-    // Per-layer slot_table tensor: shape [1, n_expert] I32.
-    //
-    // IMPORTANT: we do NOT mark this as `ggml_set_input`. Input tensors are
-    // allocated in the scheduler's CPU input buffer and copied to the GPU copy
-    // at the start of each compute split. Any mid-graph host-side write would
-    // never reach the GPU. By leaving the INPUT flag unset, the scheduler
-    // allocates this leaf tensor in the GPU compute buffer directly, so the
-    // eval-callback's `ggml_backend_tensor_set` writes straight to GPU memory
-    // that the immediately-following `ggml_get_rows` kernel reads.
-    ggml_tensor * slot_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
-    char name[64];
-    std::snprintf(name, sizeof(name), "moe.slot_table.%d", layer);
-    ggml_set_name(slot_table, name);
+    // Strategy (D-4): use the per-layer persistent slot_table tensor that was
+    // pre-allocated by `intercept_expert_tensor` at model-load time. Because
+    // it lives in the same backend buffer as the slot weight tensors (NOT a
+    // scheduler-managed temporary), its storage is never recycled, so the
+    // eval-callback's mid-graph `ggml_backend_tensor_set` is read correctly
+    // by this `ggml_get_rows`.
+    ggml_tensor * slot_table = get_slot_table_tensor(layer);
+    static int remap_cnt = 0;
+    if (remap_cnt < 4) {
+        fprintf(stderr, "[moe-d4] remap_selected_experts #%d L=%d slot_table=%p has_buf=%d\n",
+                remap_cnt, layer, (void*)slot_table,
+                slot_table && slot_table->buffer ? 1 : 0);
+    }
+    ++remap_cnt;
+    if (!slot_table) {
+        return selected_experts;
+    }
 
-    // Register the (topk -> slot_table) association for THIS graph build so
-    // the eval-callback can look up the right slot_table tensor by the topk
-    // tensor it fires on. selected_experts here IS the topk tensor (cb name
-    // "ffn_moe_topk-<il>" was already set by the caller).
     register_slot_table_for_topk(layer, selected_experts, slot_table);
 
     ggml_tensor * sel_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, selected_experts), neu * nt);
-    ggml_tensor * mapped   = ggml_get_rows(ctx, slot_table, sel_flat); // [1, neu*nt, 1, 1] I32
+    ggml_tensor * mapped   = ggml_get_rows(ctx, slot_table, sel_flat);
     return ggml_reshape_2d(ctx, mapped, neu, nt);
 }
 

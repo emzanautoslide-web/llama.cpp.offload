@@ -187,6 +187,22 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+#ifdef LLAMA_MOE_OFFLOAD
+    // When MoE expert offloading is active with a streaming cache
+    // (n_slots < n_expert), the mul_mat_id mmq kernel can crash with large
+    // microbatches due to a known interaction between ggml_get_rows-remapped
+    // expert IDs and the mm_ids_helper kernel.  Cap ubatch to 8 as a safe
+    // workaround; full-residency mode (n_slots == n_expert) is unaffected.
+    if (llama_moe::runtime_enabled() && llama_moe::streaming_mode()) {
+        constexpr uint32_t kMaxStreamingUbatch = 8;
+        if (cparams.n_ubatch > kMaxStreamingUbatch) {
+            LLAMA_LOG_WARN("%s: capping n_ubatch %u -> %u for MoE streaming safety\n",
+                    __func__, cparams.n_ubatch, kMaxStreamingUbatch);
+            cparams.n_ubatch = kMaxStreamingUbatch;
+        }
+    }
+#endif
+
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
