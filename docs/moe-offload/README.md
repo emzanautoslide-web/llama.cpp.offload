@@ -22,28 +22,46 @@ The current repacker writes a stock-loadable GGUF with page-aligned tensor data 
 
 ## Run
 
-```bash
-build-moe/bin/llama-cli \
-  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf \
-  --moe-offload \
-  --moe-cache-vram-mb 8000 \
-  --moe-predictor lru \
-  --moe-profile-csv moe-profile.csv \
-  -p "The quick brown fox" -n 32
+```powershell
+.\build-moe\bin\Release\llama-completion.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --moe-offload `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor lru `
+  -p "Hello" -n 32
 ```
 
-`--moe-predictor` accepts `lru` or `eamc`. `--moe-profile-summary PATH` writes the current summary output at request end.
+`--moe-predictor` accepts `lru` or `eamc`. `--moe-profile-csv PATH` and `--moe-profile-summary PATH` write profiling data.
 
 ## Bench
 
-```bash
-build-moe/bin/llama-moe-bench \
-  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf \
-  --pp 1024 --tg 256 --repeat 3 \
-  --moe-offload --moe-cache-vram-mb 8000 --moe-predictor eamc
+```powershell
+.\build-moe\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 1024 --tg 256 --repeat 3 `
+  --moe-cache-vram-mb 8000 --moe-predictor eamc `
+  --moe-profile-csv moe-profile.csv `
+  --moe-profile-summary moe-summary.txt
 ```
 
-The wrapper forwards to `llama-bench` and translates `--pp`, `--tg`, and `--repeat` to the upstream bench flags.
+The bench tool runs prefill + decode loops and prints:
+```
+======== MoE Offload Benchmark ========
+model: Qwen3.5-35B-A3B Q4_K_M
+predictor: eamc      cache: 8000 MB
+n_prompt: 1024  n_gen: 256  repeats: 3
+
+phase     tokens   total_ms   per_token_ms   tok/s
+prefill     1024     1320.4          1.29     774
+decode       256     9874.2         38.57      26
+
+TTFT: 1320.4 ms
+TPOT: 38.57 ms
+total: 11194.6 ms
+========================================
+```
+When `--moe-profile-summary` is set, the profiler's full per-layer summary
+(§4.7(B) format) is also written to that file.
 
 ## Current State
 
