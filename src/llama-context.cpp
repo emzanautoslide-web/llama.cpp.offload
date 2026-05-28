@@ -1308,6 +1308,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (!io_inited) {
                 io_inited = true;
                 llama_moe::slot_pool_init_io(llama_moe::get_manifest().source_path);
+
+                // Phase H: hand the slot pool a CUDA backend so the
+                // eval-callback can stall the compute stream on async H2D
+                // events via cudaStreamWaitEvent. Single-device MVP: pick
+                // the first backend whose name starts with "CUDA".
+                ggml_backend_t cuda_be = nullptr;
+                const int n_be = ggml_backend_sched_get_n_backends(sched.get());
+                for (int i = 0; i < n_be; ++i) {
+                    ggml_backend_t be = ggml_backend_sched_get_backend(sched.get(), i);
+                    const char * name = be ? ggml_backend_name(be) : nullptr;
+                    if (name && strncmp(name, "CUDA", 4) == 0) {
+                        cuda_be = be;
+                        break;
+                    }
+                }
+                llama_moe::slot_pool_set_compute_backend(cuda_be);
             }
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);

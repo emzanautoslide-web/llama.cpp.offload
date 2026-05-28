@@ -7,29 +7,40 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <vector>
 
-// No CUDA headers — this is a plain C++ file.  The worker only does fread
-// into host buffers; H2D is handled by the callback via ggml_backend_tensor_set.
+// No CUDA headers in this translation unit. The worker freads into pinned
+// host buffers and (when CUDA is available) forwards the H2D copy to the
+// extern "C" shims in ggml/src/ggml-cuda/moe_offload_io.cu via the
+// io_h2d_async / io_pinned_alloc surface declared in io.h.
 
 namespace llama_moe {
 namespace {
 
-// ── Staging buffer pool (plain host memory — no CUDA dependency) ───────
+// ── Staging buffer pool (pinned when CUDA is available, malloc otherwise) ──
 
 struct buffer_pool {
     std::vector<void *> free_list;
     size_t buf_size = 0;
+    bool   pinned   = false;   // true when buffers came from io_pinned_alloc
     std::mutex mutex;
     std::condition_variable cv;
 
     void init(size_t size, int count) {
         buf_size = size;
+        // Try pinned host memory first (overlaps with CUDA async copies).
+        // Fall back to malloc on CPU-only builds or if pinned alloc fails.
         for (int i = 0; i < count; ++i) {
-            void * p = malloc(size);
+            void * p = io_pinned_alloc(size);
+            if (p) {
+                pinned = true;
+            } else {
+                p = malloc(size);
+            }
             free_list.push_back(p);
         }
     }
@@ -52,7 +63,10 @@ struct buffer_pool {
 
     void shutdown() {
         std::lock_guard<std::mutex> lock(mutex);
-        for (void * p : free_list) free(p);
+        for (void * p : free_list) {
+            if (pinned) io_pinned_free(p);
+            else        free(p);
+        }
         free_list.clear();
     }
 };
@@ -134,6 +148,7 @@ struct io_worker {
             if (stop_flag.load(std::memory_order_relaxed) && queue.empty()) break;
 
             while (queue.pop(req)) {
+                const auto read_start = std::chrono::steady_clock::now();
                 int rc = _fseeki64(fp, (int64_t) req.file_offset, SEEK_SET);
                 if (rc != 0) {
                     fprintf(stderr, "[moe-io] seek to %llu failed\n",
@@ -149,7 +164,36 @@ struct io_worker {
                     outstanding.fetch_sub(1, std::memory_order_relaxed);
                     continue;
                 }
-                // Push to completed list — caller will do H2D
+                const auto read_end = std::chrono::steady_clock::now();
+                req.ssd_read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        read_end - read_start).count();
+
+                // Phase H: issue async H2D into the slot's GPU address. When
+                // CUDA is unavailable or the call fails, leave h2d_event null
+                // and let the caller fall back to ggml_backend_tensor_set.
+                // Phase I: also record a begin event so the eval-callback can
+                // compute real h2d_us via cudaEventElapsedTime.
+                req.h2d_event       = nullptr;
+                req.h2d_begin_event = nullptr;
+                if (req.h2d && req.gpu_dst) {
+                    void * ev_begin = nullptr;
+                    void * ev_end   = nullptr;
+                    if (io_h2d_async_timed(req.gpu_dst, req.pinned_buf, req.blob_size,
+                                           &ev_begin, &ev_end)) {
+                        req.h2d_begin_event = ev_begin;
+                        req.h2d_event       = ev_end;
+                    } else {
+                        static bool warned = false;
+                        if (!warned) {
+                            warned = true;
+                            fprintf(stderr, "[moe-io] io_h2d_async_timed failed; "
+                                            "falling back to sync H2D\n");
+                        }
+                    }
+                }
+
+                // Push to completed list — caller drains, performs sync H2D
+                // fallback if needed, waits on the event, then recycles.
                 done.push(req);
                 outstanding.fetch_sub(1, std::memory_order_relaxed);
             }
@@ -208,6 +252,10 @@ int io_wait_all() {
     return (int) done.size();
 }
 
+std::vector<io_request> io_drain_completed() {
+    return g_worker.done.drain();
+}
+
 int io_outstanding() {
     return g_worker.outstanding.load(std::memory_order_relaxed);
 }
@@ -232,6 +280,13 @@ extern "C" {
     GGML_BACKEND_API bool   moe_io_cuda_compute_wait (ggml_backend_t backend, void * ev);
     GGML_BACKEND_API bool   moe_io_cuda_event_sync   (void * ev);
     GGML_BACKEND_API size_t moe_io_cuda_events_in_use(void);
+    GGML_BACKEND_API void * moe_io_cuda_event_acquire (void);
+    GGML_BACKEND_API bool   moe_io_cuda_record_on_h2d (void * ev);
+    GGML_BACKEND_API bool   moe_io_cuda_record_on_compute(ggml_backend_t backend, void * ev);
+    GGML_BACKEND_API int64_t moe_io_cuda_elapsed_us   (void * begin, void * end);
+    GGML_BACKEND_API bool   moe_io_cuda_h2d_async_timed(void * dst_dev, const void * src_pinned,
+                                                        size_t bytes, void ** out_ev_begin,
+                                                        void ** out_ev_end);
 }
 
 void * io_pinned_alloc(size_t bytes)                       { return moe_io_cuda_pinned_alloc(bytes); }
@@ -242,6 +297,12 @@ void   io_event_release(void * ev)                         { moe_io_cuda_event_r
 bool   io_compute_wait(ggml_backend_t b, void * ev)        { return moe_io_cuda_compute_wait(b, ev); }
 bool   io_event_sync  (void * ev)                          { return moe_io_cuda_event_sync(ev); }
 size_t io_events_in_use()                                  { return moe_io_cuda_events_in_use(); }
+bool   io_h2d_async_timed(void * d, const void * s, size_t n,
+                          void ** evb, void ** eve)        { return moe_io_cuda_h2d_async_timed(d, s, n, evb, eve); }
+void * io_event_acquire ()                                 { return moe_io_cuda_event_acquire(); }
+bool   io_record_on_h2d (void * ev)                        { return moe_io_cuda_record_on_h2d(ev); }
+bool   io_record_on_compute(ggml_backend_t b, void * ev)   { return moe_io_cuda_record_on_compute(b, ev); }
+int64_t io_event_elapsed_us(void * b, void * e)            { return moe_io_cuda_elapsed_us(b, e); }
 
 #else // !GGML_USE_CUDA — stubs for CPU-only build
 
@@ -252,6 +313,11 @@ void   io_event_release(void *)                            { }
 bool   io_compute_wait(ggml_backend_t, void *)             { return false; }
 bool   io_event_sync  (void *)                             { return false; }
 size_t io_events_in_use()                                  { return 0; }
+bool   io_h2d_async_timed(void *, const void *, size_t, void **, void **) { return false; }
+void * io_event_acquire ()                                 { return nullptr; }
+bool   io_record_on_h2d (void *)                           { return false; }
+bool   io_record_on_compute(ggml_backend_t, void *)        { return false; }
+int64_t io_event_elapsed_us(void *, void *)                { return -1; }
 
 #endif // GGML_USE_CUDA
 

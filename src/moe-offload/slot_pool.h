@@ -89,6 +89,12 @@ void slot_pool_init_io(const std::string & source_path);
 // Phase D-5: shutdown the async I/O worker.
 void slot_pool_shutdown_io();
 
+// Phase H: tell the slot pool which CUDA backend owns the compute stream
+// so the eval-callback can stall it on async H2D events via
+// cudaStreamWaitEvent. Pass nullptr to disable async H2D (callback falls
+// back to synchronous ggml_backend_tensor_set).
+void slot_pool_set_compute_backend(ggml_backend_t backend);
+
 // Phase E-3: end the current request (calls predictor.end_request).
 void slot_pool_end_request();
 

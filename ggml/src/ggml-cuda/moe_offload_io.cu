@@ -70,6 +70,9 @@ cudaStream_t ensure_h2d_stream() {
 
 cudaEvent_t acquire_event() {
     // Caller must hold g_state.mutex.
+    // Phase I: events are timing-capable so they can be used for both
+    // cudaStreamWaitEvent (sync ordering) and cudaEventElapsedTime
+    // (per-layer compute_us, per-miss h2d_us).
     if (!g_state.event_pool.empty()) {
         cudaEvent_t ev = g_state.event_pool.back();
         g_state.event_pool.pop_back();
@@ -77,7 +80,7 @@ cudaEvent_t acquire_event() {
         return ev;
     }
     cudaEvent_t ev = nullptr;
-    cudaError_t e = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+    cudaError_t e = cudaEventCreateWithFlags(&ev, cudaEventDefault);
     if (e != cudaSuccess) {
         fprintf(stderr, "[moe-io-cuda] cudaEventCreate failed: %s\n", cudaGetErrorString(e));
         return nullptr;
@@ -180,6 +183,121 @@ GGML_BACKEND_API bool moe_io_cuda_event_sync(void * ev) {
 GGML_BACKEND_API size_t moe_io_cuda_events_in_use() {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     return g_state.events_in_use;
+}
+
+// ---------------------------------------------------------------------------
+// Phase I: timing-event helpers.
+//
+// Events returned by the existing pool are timing-capable; the helpers below
+// expose explicit "record on h2d / compute stream" + "query elapsed" so the
+// eval-callback can fill profile_row.compute_us and profile_row.h2d_us with
+// real CUDA-measured numbers (no host-side timing).
+// ---------------------------------------------------------------------------
+
+// Acquire one event from the pool. Returns nullptr on failure.
+GGML_BACKEND_API void * moe_io_cuda_event_acquire() {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    cudaEvent_t ev = acquire_event();
+    return (void *) ev;
+}
+
+// Record event on the dedicated MoE H2D stream.
+GGML_BACKEND_API bool moe_io_cuda_record_on_h2d(void * ev) {
+    if (!ev) return false;
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    cudaStream_t s = ensure_h2d_stream();
+    if (!s) return false;
+    cudaError_t e = cudaEventRecord((cudaEvent_t) ev, s);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[moe-io-cuda] record_on_h2d cudaEventRecord failed: %s\n",
+                cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
+
+// Record event on the backend's compute stream.
+GGML_BACKEND_API bool moe_io_cuda_record_on_compute(ggml_backend_t backend, void * ev) {
+    if (!backend || !ev) return false;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaStream_t compute_stream = cuda_ctx->stream();
+    cudaError_t e = cudaEventRecord((cudaEvent_t) ev, compute_stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[moe-io-cuda] record_on_compute cudaEventRecord failed: %s\n",
+                cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+}
+
+// Synchronize on `end` and return elapsed time (begin -> end) in microseconds.
+// Returns -1 on error.
+GGML_BACKEND_API int64_t moe_io_cuda_elapsed_us(void * begin, void * end) {
+    if (!begin || !end) return -1;
+    cudaError_t e = cudaEventSynchronize((cudaEvent_t) end);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[moe-io-cuda] elapsed_us cudaEventSynchronize failed: %s\n",
+                cudaGetErrorString(e));
+        return -1;
+    }
+    float ms = 0.0f;
+    e = cudaEventElapsedTime(&ms, (cudaEvent_t) begin, (cudaEvent_t) end);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[moe-io-cuda] cudaEventElapsedTime failed: %s\n",
+                cudaGetErrorString(e));
+        return -1;
+    }
+    if (ms < 0.0f) ms = 0.0f;
+    return (int64_t) (ms * 1000.0f);
+}
+
+// Variant of moe_io_cuda_h2d_async that also records a begin event before the
+// memcpy. Both events come from the same pool and are timing-capable, so they
+// can be used both for cudaStreamWaitEvent (compute ordering on *ev_end) and
+// for cudaEventElapsedTime (per-miss h2d_us).
+GGML_BACKEND_API bool moe_io_cuda_h2d_async_timed(void * dst_dev, const void * src_pinned,
+                                                  size_t bytes, void ** out_ev_begin,
+                                                  void ** out_ev_end) {
+    if (!dst_dev || !src_pinned || bytes == 0 || !out_ev_begin || !out_ev_end) return false;
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    cudaStream_t s = ensure_h2d_stream();
+    if (!s) return false;
+
+    cudaEvent_t ev_begin = acquire_event();
+    if (!ev_begin) return false;
+    cudaError_t e = cudaEventRecord(ev_begin, s);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[moe-io-cuda] h2d_async_timed begin record failed: %s\n",
+                cudaGetErrorString(e));
+        release_event_locked(ev_begin);
+        return false;
+    }
+
+    e = cudaMemcpyAsync(dst_dev, src_pinned, bytes, cudaMemcpyHostToDevice, s);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[moe-io-cuda] h2d_async_timed cudaMemcpyAsync failed: %s\n",
+                cudaGetErrorString(e));
+        release_event_locked(ev_begin);
+        return false;
+    }
+
+    cudaEvent_t ev_end = acquire_event();
+    if (!ev_end) {
+        release_event_locked(ev_begin);
+        return false;
+    }
+    e = cudaEventRecord(ev_end, s);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[moe-io-cuda] h2d_async_timed end record failed: %s\n",
+                cudaGetErrorString(e));
+        release_event_locked(ev_begin);
+        release_event_locked(ev_end);
+        return false;
+    }
+
+    *out_ev_begin = (void *) ev_begin;
+    *out_ev_end   = (void *) ev_end;
+    return true;
 }
 
 } // extern "C"

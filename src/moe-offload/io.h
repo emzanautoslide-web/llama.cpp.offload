@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 // Forward declaration of the ggml backend handle so we don't pull
 // ggml-backend.h into every translation unit that includes this header.
@@ -41,6 +42,14 @@ struct io_request {
     size_t   blob_size;    // bytes to read
     uint64_t file_offset;  // absolute byte offset in .moe.gguf
     char *   gpu_dst;      // GPU destination address (slot_tensor->data + slot * nb[2])
+
+    // Phase H: async H2D plumbing.
+    bool     h2d;          // when true, worker issues io_h2d_async after fread
+    void *   h2d_event;    // opaque CUDA event handle filled by the worker on success
+    // Phase I: paired begin event so the eval-callback can later query
+    // cudaEventElapsedTime(begin, h2d_event) for real h2d_us.
+    void *   h2d_begin_event;
+    int64_t  ssd_read_us;  // worker-measured fread duration in microseconds
 };
 
 // One-time init.
@@ -64,6 +73,11 @@ bool io_submit(struct io_request req);
 // Block until all previously submitted reads are complete.
 // Returns the number of requests drained.
 int io_wait_all();
+
+// Phase H: drain completed requests from the worker (does not block).
+// Caller takes ownership of the returned records: must release any
+// `pinned_buf`/`h2d_event` they contain.
+std::vector<io_request> io_drain_completed();
 
 // Number of outstanding (submitted but not yet waited) requests.
 int io_outstanding();
@@ -105,5 +119,32 @@ LLAMA_API bool io_event_sync(void * ev);
 
 // Diagnostic: number of events currently held by callers (not in the pool).
 LLAMA_API size_t io_events_in_use();
+
+// ---------------------------------------------------------------------------
+// Phase I: timing-event helpers used to measure compute_us / h2d_us.
+// ---------------------------------------------------------------------------
+
+// Variant of io_h2d_async that also records a begin event on the H2D stream
+// before the memcpy. Both events come from the same pool; both are
+// timing-capable so they can be used with io_event_elapsed_us. The end event
+// (*out_ev_end) is also the one the compute stream should wait on via
+// io_compute_wait. Returns false if CUDA is unavailable or any CUDA call
+// fails.
+LLAMA_API bool io_h2d_async_timed(void * dst_dev, const void * src_pinned, size_t bytes,
+                                  void ** out_ev_begin, void ** out_ev_end);
+
+// Acquire a single timing-capable event from the pool. Returns nullptr on
+// failure or on a CPU-only build.
+LLAMA_API void * io_event_acquire();
+
+// Record `ev` on the dedicated MoE H2D stream.
+LLAMA_API bool io_record_on_h2d(void * ev);
+
+// Record `ev` on the backend's compute stream.
+LLAMA_API bool io_record_on_compute(ggml_backend_t backend, void * ev);
+
+// Synchronize on `end` then return elapsed time from `begin` to `end` in
+// microseconds. Returns -1 on error or on a CPU-only build.
+LLAMA_API int64_t io_event_elapsed_us(void * begin, void * end);
 
 } // namespace llama_moe

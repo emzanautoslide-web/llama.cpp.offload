@@ -84,6 +84,26 @@ struct slot_pool_state {
     std::unique_ptr<predictor> pred;
     uint64_t token_idx = 0;
     uint64_t current_token_idx = 0;
+
+    // Phase H: CUDA backend whose compute stream is stalled on async H2D
+    // events via cudaStreamWaitEvent. Set by slot_pool_set_compute_backend.
+    // When null, the eval-callback falls back to synchronous H2D.
+    ggml_backend_t compute_backend = nullptr;
+
+    // Phase I: per-batch buffered profile rows. We record compute_us / h2d_us
+    // via CUDA timing events whose elapsed time can only be queried after the
+    // compute stream catches up. Rows accumulate here during the batch and
+    // are patched + flushed to the profiler at slot_pool_end_request().
+    struct pending_profile_row {
+        profile_row row;
+        int  logical = -1;
+        void * compute_begin_event = nullptr;
+        void * compute_end_event   = nullptr;
+        // (begin, end) timing-capable events per missed expert blob.
+        std::vector<std::pair<void *, void *>> h2d_events;
+    };
+    std::vector<pending_profile_row> pending_rows;
+    int last_pending_idx = -1;
 };
 
 slot_pool_state & state() {
@@ -158,6 +178,9 @@ void configure_slot_pool() {
     s.topk_calls = 0;
     s.token_idx = 0;
     s.current_token_idx = 0;
+
+    s.pending_rows.clear();
+    s.last_pending_idx = -1;
 
     // Phase E: init predictor from runtime options
     const runtime_options & opts = get_options();
@@ -663,10 +686,39 @@ void lru_touch(slot_pool_state::layer_cache & lc, int32_t expert) {
 
 bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     (void) user_data;
-    if (ask) return true;       // run for every node
-    if (!t || !t->name[0]) return true;
+    if (!t || !t->name[0]) {
+        return true;
+    }
 
     auto & s = state();
+
+    if (ask) {
+        // Phase I: when the *next* MoE layer's topk is about to be computed,
+        // close the previous layer's compute interval by recording
+        // compute_end on the compute stream. We take the lock only when
+        // there is plausibly something to do (cheap atomic-like check on
+        // the previously-set index).
+        if (s.last_pending_idx < 0) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (!s.configured || !s.compute_backend) return true;
+        if (s.last_pending_idx < 0 ||
+            (size_t) s.last_pending_idx >= s.pending_rows.size()) return true;
+        auto stt_it = s.topk_to_slot_table.find(t);
+        if (stt_it == s.topk_to_slot_table.end()) return true;
+        auto & p = s.pending_rows[s.last_pending_idx];
+        if (!p.compute_end_event) {
+            void * ev = io_event_acquire();
+            if (ev && io_record_on_compute(s.compute_backend, ev)) {
+                p.compute_end_event = ev;
+            } else if (ev) {
+                io_event_release(ev);
+            }
+        }
+        return true;
+    }
+
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.configured) return true;
 
@@ -736,6 +788,19 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
     load_stats layer_load_stats;
     int misses_loaded = 0;
+
+    // Phase H: per-miss bookkeeping needed when the worker completion comes
+    // back out of submission order. We carry the slot tensor pointer (so the
+    // fallback sync H2D path can call ggml_backend_tensor_set) and the
+    // write_off, keyed by pinned_buf because that's the unique handle the
+    // worker echoes back to us.
+    struct miss_meta {
+        ggml_tensor * slot_tensor;
+        size_t        write_off;
+    };
+    std::unordered_map<void *, miss_meta> miss_lookup;
+    int submitted_misses = 0;
+
     for (int32_t e : uniq) {
         if (lc.exp2slot.count(e)) continue;
 
@@ -760,15 +825,116 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             lc.slot_to_expert[slot] = -1;
         }
 
-        if (!load_expert_into_slot(s, mf, (uint32_t) logical, e, slot, &layer_load_stats)) {
-            GGML_ABORT("MoE-offload: failed to load expert into slot");
+        // Phase H: submit one async read per (kind) into the slot's GPU
+        // address. The worker freads into a pinned staging buffer and then
+        // issues cudaMemcpyAsync on the dedicated MoE H2D stream, recording
+        // an event. The callback waits on those events below.
+        for (int k = 0; k < EXPERT_KIND_COUNT; ++k) {
+            ggml_tensor * slot_tensor = s.slot_tensors[logical][k];
+            if (!slot_tensor) continue;
+            const expert_record & rec = mf.at((uint32_t) logical, (uint32_t) e, (expert_kind) k);
+
+            const size_t stride = slot_tensor->nb[2];
+            if (rec.size > stride) {
+                LLAMA_LOG_ERROR("moe_eval_callback: rec.size=%llu > stride=%zu (L%d e%d k%d)\n",
+                        (unsigned long long) rec.size, stride, logical, e, k);
+                GGML_ABORT("MoE-offload: expert blob too large for slot stride");
+            }
+            const size_t buf_size = ggml_backend_buffer_get_size(slot_tensor->buffer);
+            const size_t write_off = (size_t) slot * stride;
+            const size_t tensor_off = (size_t)((char *)slot_tensor->data -
+                                               (char *)ggml_backend_buffer_get_base(slot_tensor->buffer));
+            if (tensor_off + write_off + rec.size > buf_size) {
+                LLAMA_LOG_ERROR("moe_eval_callback: OOB write tensor_off=%zu slot_off=%zu rec=%llu buf_size=%zu (L%d e%d k%d slot=%d)\n",
+                        tensor_off, write_off, (unsigned long long) rec.size, buf_size, logical, e, k, (int) slot);
+                GGML_ABORT("MoE-offload: slot OOB");
+            }
+
+            void * pinned = io_acquire_buffer();
+            io_request req{};
+            req.layer       = logical;
+            req.expert      = e;
+            req.kind        = k;
+            req.slot        = slot;
+            req.pinned_buf  = pinned;
+            req.blob_size   = rec.size;
+            req.file_offset = mf.data_offset + rec.rel_offset;
+            req.gpu_dst     = (char *) slot_tensor->data + write_off;
+            req.h2d         = (s.compute_backend != nullptr);
+            req.h2d_event   = nullptr;
+            req.h2d_begin_event = nullptr;
+            req.ssd_read_us = 0;
+
+            miss_lookup[pinned] = miss_meta{ slot_tensor, write_off };
+
+            if (!io_submit(req)) {
+                LLAMA_LOG_ERROR("moe_eval_callback: io_submit failed (queue full) L%d e%d k%d\n",
+                        logical, e, k);
+                GGML_ABORT("MoE-offload: io_submit queue overflow");
+            }
+            ++submitted_misses;
         }
 
+        // Reserve the slot for this expert immediately so a later miss in the
+        // same batch does not pick it as a victim. The actual bytes land
+        // asynchronously below.
         lc.slot_to_expert[slot] = e;
         lc.exp2slot[e] = slot;
         lru_touch(lc, e);
         ++s.cache_misses;
         ++misses_loaded;
+    }
+
+    int64_t stall_us = 0;
+    // Phase I: per-miss h2d timing events stashed for elapsed-time query at
+    // end_request. Owned by the pending_profile_row we create below.
+    std::vector<std::pair<void *, void *>> h2d_events_for_row;
+    if (submitted_misses > 0) {
+        const auto wait_start = std::chrono::steady_clock::now();
+
+        // Drain the worker: spin until all submitted reads (and their queued
+        // async H2D copies) have been issued.
+        while (io_outstanding() > 0) {
+            std::this_thread::yield();
+        }
+        auto completions = io_drain_completed();
+
+        for (auto & c : completions) {
+            layer_load_stats.ssd_read_us += c.ssd_read_us;
+            layer_load_stats.ssd_bytes   += c.blob_size;
+            ++layer_load_stats.ssd_reads;
+
+            if (c.h2d_event) {
+                // Async path: tell the compute stream to wait on the H2D
+                // end event before consuming the slot weights. Stash both
+                // events (begin, end) so end_request can query their
+                // elapsed time for real h2d_us. They are released back to
+                // the pool at end_request after the query.
+                io_compute_wait(s.compute_backend, c.h2d_event);
+                h2d_events_for_row.emplace_back(c.h2d_begin_event, c.h2d_event);
+            } else {
+                // Fallback: CUDA unavailable or io_h2d_async failed. Look up
+                // the slot tensor by the pinned-buffer handle and do a sync
+                // ggml_backend_tensor_set.
+                auto it = miss_lookup.find(c.pinned_buf);
+                if (it == miss_lookup.end()) {
+                    LLAMA_LOG_ERROR("moe_eval_callback: completion without lookup entry (L%d)\n", logical);
+                } else {
+                    const auto h2d_start = std::chrono::steady_clock::now();
+                    ggml_backend_tensor_set(it->second.slot_tensor, c.pinned_buf,
+                                            it->second.write_off, c.blob_size);
+                    const auto h2d_end = std::chrono::steady_clock::now();
+                    layer_load_stats.h2d_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                            h2d_end - h2d_start).count();
+                }
+            }
+
+            io_release_buffer(c.pinned_buf);
+        }
+
+        const auto wait_end = std::chrono::steady_clock::now();
+        stall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                wait_end - wait_start).count();
     }
 
     // Strategy (D-4): build slot_table host buffer (init 0, set hot entries).
@@ -804,26 +970,49 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     }
     ++s.topk_calls;
 
-    // Phase E-1: record per-layer profiling row (via runtime's profiler).
+    // Phase E-1 / Phase I: buffer the per-layer profile row. compute_us
+    // and h2d_us are patched in at slot_pool_end_request() once the CUDA
+    // timing events have signalled.
     {
         int k_req = (int) uniq.size();
-        profile_row row;
-        row.token_idx = row_token_idx;
-        row.phase = phase;
-        row.layer = logical;
-        row.k_required = k_req;
-        row.k_hit = k_req - misses_loaded;
-        row.k_miss = misses_loaded;
-        row.ssd_read_us = layer_load_stats.ssd_read_us;
-        row.h2d_us = layer_load_stats.h2d_us;
-        row.stall_us = layer_load_stats.ssd_read_us + layer_load_stats.h2d_us;
-        row.ssd_bytes = layer_load_stats.ssd_bytes;
-        row.ssd_reads = layer_load_stats.ssd_reads;
-        row.cache_resident_experts = (int) lc.exp2slot.size();
-        row.predictor = s.pred->name();
-        if (profiler * p = get_profiler()) {
-            p->record(row);
+        slot_pool_state::pending_profile_row p;
+        p.logical = logical;
+        p.row.token_idx = row_token_idx;
+        p.row.phase = phase;
+        p.row.layer = logical;
+        p.row.k_required = k_req;
+        p.row.k_hit = k_req - misses_loaded;
+        p.row.k_miss = misses_loaded;
+        p.row.ssd_read_us = layer_load_stats.ssd_read_us;
+        // Phase I: h2d_us comes from CUDA events on the async path. The
+        // sync-fallback contribution (already host-measured) is preserved
+        // here; event-elapsed times are added at end_request.
+        p.row.h2d_us = layer_load_stats.h2d_us;
+        p.row.compute_us = 0;  // filled in at end_request
+        // Phase H: stall_us is the host-measured wall-clock around the
+        // io_compute_wait drain.
+        p.row.stall_us = stall_us;
+        p.row.ssd_bytes = layer_load_stats.ssd_bytes;
+        p.row.ssd_reads = layer_load_stats.ssd_reads;
+        p.row.cache_resident_experts = (int) lc.exp2slot.size();
+        p.row.predictor = s.pred->name();
+        p.h2d_events = std::move(h2d_events_for_row);
+
+        // Phase I: record compute_begin on the compute stream right after
+        // the slot_table write. compute_end is recorded when the next MoE
+        // layer's topk callback fires (ask=true branch) or at
+        // slot_pool_end_request for the final layer.
+        if (s.compute_backend) {
+            void * ev = io_event_acquire();
+            if (ev && io_record_on_compute(s.compute_backend, ev)) {
+                p.compute_begin_event = ev;
+            } else if (ev) {
+                io_event_release(ev);
+            }
         }
+
+        s.pending_rows.push_back(std::move(p));
+        s.last_pending_idx = (int) s.pending_rows.size() - 1;
     }
 
     if ((uint32_t) logical + 1 == mf.n_layers) {
@@ -862,11 +1051,73 @@ void slot_pool_init_io(const std::string & source_path) {
 
 void slot_pool_shutdown_io() {
     io_shutdown();
+    LLAMA_LOG_INFO("%s: io worker stopped; events_in_use=%zu\n",
+            __func__, io_events_in_use());
+}
+
+void slot_pool_set_compute_backend(ggml_backend_t backend) {
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.compute_backend = backend;
+    LLAMA_LOG_INFO("%s: compute backend = %s\n", __func__,
+            backend ? ggml_backend_name(backend) : "<none>");
 }
 
 void slot_pool_end_request() {
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
+
+    // Phase I: close out the final layer's compute interval. The compute
+    // stream is by now (or shortly will be) idle, so cudaEventRecord here
+    // captures roughly the end of the last layer's MoE compute.
+    if (s.compute_backend && s.last_pending_idx >= 0 &&
+        (size_t) s.last_pending_idx < s.pending_rows.size()) {
+        auto & p = s.pending_rows[s.last_pending_idx];
+        if (!p.compute_end_event) {
+            void * ev = io_event_acquire();
+            if (ev && io_record_on_compute(s.compute_backend, ev)) {
+                p.compute_end_event = ev;
+            } else if (ev) {
+                io_event_release(ev);
+            }
+        }
+    }
+
+    // Phase I: drain buffered rows. Query CUDA elapsed times for compute
+    // and h2d intervals, patch into the row, hand off to the profiler,
+    // then release all events back to the pool.
+    profiler * prof = get_profiler();
+    for (auto & p : s.pending_rows) {
+        int64_t compute_us = 0;
+        if (p.compute_begin_event && p.compute_end_event) {
+            int64_t us = io_event_elapsed_us(p.compute_begin_event, p.compute_end_event);
+            if (us > 0) compute_us = us;
+        }
+        p.row.compute_us = compute_us;
+
+        int64_t h2d_us_events = 0;
+        for (auto & ev_pair : p.h2d_events) {
+            if (ev_pair.first && ev_pair.second) {
+                int64_t us = io_event_elapsed_us(ev_pair.first, ev_pair.second);
+                if (us > 0) h2d_us_events += us;
+            }
+        }
+        p.row.h2d_us += h2d_us_events;
+
+        if (prof) {
+            prof->record(p.row);
+        }
+
+        if (p.compute_begin_event) io_event_release(p.compute_begin_event);
+        if (p.compute_end_event)   io_event_release(p.compute_end_event);
+        for (auto & ev_pair : p.h2d_events) {
+            if (ev_pair.first)  io_event_release(ev_pair.first);
+            if (ev_pair.second) io_event_release(ev_pair.second);
+        }
+    }
+    s.pending_rows.clear();
+    s.last_pending_idx = -1;
+
     if (s.pred) {
         s.pred->end_request();
     }
