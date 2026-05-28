@@ -410,6 +410,17 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+#ifdef LLAMA_MOE_OFFLOAD
+    // Phase L.1: stop the MoE I/O worker thread before any backend buffers,
+    // pinned host buffers, or CUDA event pools owned by the slot pool are
+    // freed. Without this, the worker thread is still alive at process exit
+    // and trips STATUS_STACK_BUFFER_OVERRUN (-1073740791). Safe to call
+    // unconditionally — io_shutdown() is a no-op when the worker was never
+    // started.
+    if (llama_moe::runtime_enabled()) {
+        llama_moe::slot_pool_shutdown_io();
+    }
+#endif
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];

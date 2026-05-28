@@ -92,10 +92,10 @@ CSV columns:
 | `k_required` | Distinct experts required by the router for this layer/callback. |
 | `k_hit` | Required experts already resident in the slot cache. |
 | `k_miss` | Required experts loaded from the repacked GGUF. |
-| `ssd_read_us` | Wall microseconds spent in file seek/read for misses. |
-| `h2d_us` | Wall microseconds spent in `ggml_backend_tensor_set` for slot uploads. |
-| `compute_us` | Reserved for CUDA event timing around MoE compute; currently `0` in the sync MVP path. |
-| `stall_us` | Current sync wait cost for miss handling (`ssd_read_us + h2d_us`). |
+| `ssd_read_us` | Wall microseconds spent in `fread` for misses (worker-thread-measured). |
+| `h2d_us` | Microseconds spent in host→device copy. On the CUDA async path this is the sum of `cudaEventElapsedTime` between the per-blob begin/end events recorded on the dedicated MoE H2D stream; on the sync fallback it is host-measured around `ggml_backend_tensor_set`. Mixed contribution per row when both paths fire. |
+| `compute_us` | CUDA-event-timed compute interval for the layer, derived from begin/end events recorded on the compute stream and queried at `slot_pool_end_request()`. Each row's interval brackets the slot_table write of layer L through the topk callback of layer L+1 (or `end_request` for the final layer); this is an over-approximation that includes layer L's MoE compute plus the following attention block. |
+| `stall_us` | Host wall-clock around the miss-completion drain (Phase H). Not the precise compute-stream wait loss; the source plan accepted this approximation. |
 | `cache_resident_experts` | Number of experts resident for the layer after miss handling. |
 | `predictor` | `lru` or `eamc`. |
 
@@ -111,9 +111,15 @@ Implemented in this slice:
 - Guarded hooks at model load, decode request boundaries, and MoE top-k graph construction.
 - `llama-moe-repack` and `llama-moe-bench` targets.
 - **D-4**: Pre-allocated slot_table tensors via `create_unfiled_tensor`; zero-init of all slot tensors; ubatch auto-cap to 8 in streaming mode.
-- **D-5**: Threaded I/O worker (`src/moe-offload/io.{h,cpp}`) exists, but the active miss path uses measured synchronous `fread` + `ggml_backend_tensor_set` so slot contents are correct. Full async H2D/event overlap remains post-MVP.
+- **D-5**: Threaded I/O worker (`src/moe-offload/io.{h,cpp}`).
 - **E**: Per-layer CSV profiling rows; snapshot summary; LRU/EAMC predictor wired into eval-callback eviction.
 - **F**: `llama-moe-bench` emits the §4.7-style stdout/file summary and writes nonempty CSV rows when requested.
+- **G**: CUDA stream accessor (`moe_io_cuda_*` in `ggml/src/ggml-cuda/moe_offload_io.cu`), pinned-host staging, dedicated MoE H2D stream, event pool.
+- **H**: Eval-callback rewired to async H2D via `io_h2d_async_timed` + `io_compute_wait` (`cudaStreamWaitEvent` on the compute stream). Synchronous double-read of the miss blob removed.
+- **I**: Real `compute_us` via CUDA events. Profile rows are buffered per `llama_decode` batch and flushed at `slot_pool_end_request()` after `cudaEventElapsedTime` queries. Per-miss `h2d_us` now comes from event timing on the async path.
+- **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
+- **K**: Three C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`) alongside Phase G's `test-cuda-stream` smoke. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
+- **L**: IO worker shutdown wired into `llama_context::~llama_context()`; small-cache (≤8000 MiB) and multi-token-prompt streaming deadlocks fixed by enlarging the IO buffer pool to cover worst-case in-flight misses and by excluding just-reserved experts from LRU/predictor eviction within the same callback.
 
 ## Correctness
 
@@ -168,17 +174,51 @@ Tracking this drift to zero is on the Phase L / post-MVP hygiene list.
 
 Deviations from the source plan (`implementation_plan_mvp_20260529.md` §3):
 
-- `--moe-cache-vram-mb 4000` deadlocks on this dev box (n_slots=48 falls
-  below the n_ubatch×topk=64 lower bound and the slot pool stalls before
-  generation starts). The harness defaults to 12000 MiB, which still
-  forces ~60% misses and remains a representative streaming workload.
-- The plan called for prompt `"The quick brown fox"`. On this dev box
-  any prompt longer than ~2 tokens hangs `llama-completion` during
-  prefill in streaming mode (no diagnostic output beyond
-  `generate: n_predict=...`). The harness defaults to `"Hello"` to keep
-  the gate runnable; the same prompt-length sensitivity is reproducible
-  without `--logit-dump`, so the gate itself is not the cause. Both
-  deadlocks are filed against Phase L.
+- `--moe-cache-vram-mb 4000` previously deadlocked during prefill on this
+  dev box; Phase L raised the IO worker's pinned-buffer pool floor so the
+  miss-loop can submit a layer's worst-case unique-expert demand without
+  starving on staging buffers. Re-tested at cache=4000 with `-n 4 -p
+  "Hello"`: runs to completion. The harness still defaults to 12000 MiB
+  because the dev-box reference run was captured at that size; lower
+  caches can now be used safely.
+- The plan called for prompt `"The quick brown fox"`. Multi-token-prompt
+  streaming hangs (same buffer-pool starvation) are also fixed by the
+  Phase L bump. Re-tested with prompt `"The quick brown fox"` at
+  cache=12000, `-n 4`: prefill + decode complete cleanly.
+- Phase J's measured drift number (`max|Δlogit|=4.64e-01`) was captured
+  on the build that produced the first `"Hello, I am a 20 year"` smoke.
+  Subsequent regressions on the same HEAD have made full-residency
+  itself crash with `GGML_ASSERT(buf != NULL && "tensor buffer not set")`
+  inside `prefetch_all_experts`; this regression is pre-existing
+  relative to Phase L (confirmed by `git stash` baseline) and prevents
+  the harness from regenerating the reference dump. Root-causing this
+  regression is on the post-MVP list; the Phase J drift number stays in
+  the table above as the last good measurement.
+
+## Test surface
+
+CTest targets under label `moe-offload` (4 tests, all pass on the dev box):
+
+| Test | Phase | Purpose |
+|---|---|---|
+| `test-cuda-stream` | G | Pinned alloc + async H2D + event ordering smoke. |
+| `test-eamc-cosine` | K | EAMC cosine ordering and redundancy replacement on full insert. |
+| `test-lru-eviction` | K | Hand-computed LRU score values, victim ordering, per-layer isolation. |
+| `test-manifest-roundtrip` | K | GGUF manifest sanity (version=2, table size, per-record file ranges). Self-skips with exit 0 when `LLAMA_MOE_TEST_GGUF` is unset. |
+
+```powershell
+ctest --test-dir build-moe -C Release -L moe-offload --output-on-failure
+```
+
+Dev-box-only PowerShell harnesses under `tests/moe-offload/` (not
+registered with CTest because they need the multi-GB model):
+
+- `test-golden-logits.ps1` — Phase J streaming-vs-full-residency logit
+  comparison gate.
+- `compare_logits.py` — binary-dump comparator used by the harness.
+
+See [`tests/moe-offload/README.md`](../../tests/moe-offload/README.md)
+for runtime prereqs and invocation details.
 
 ## Troubleshooting
 

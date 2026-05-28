@@ -801,6 +801,14 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     std::unordered_map<void *, miss_meta> miss_lookup;
     int submitted_misses = 0;
 
+    // Phase L.2: track experts reserved in THIS callback so the eviction
+    // path cannot pick them as victims. Without this, the LRU/EAMC score
+    // function may return a lower score for a just-reserved expert than
+    // for an established resident, causing us to evict a slot whose H2D
+    // is still in flight (corrupting weights for the consumer matmul of
+    // the very same forward pass).
+    std::unordered_set<int32_t> reserved_this_call;
+
     for (int32_t e : uniq) {
         if (lc.exp2slot.count(e)) continue;
 
@@ -811,13 +819,28 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         }
         if (slot < 0) {
             // Phase E: use predictor.score for eviction (lower = evict).
+            // Phase L.2: skip experts reserved earlier in this same
+            // callback — their slots hold in-flight H2D data.
             float best_score = 1e30f;
             int32_t best_victim = -1;
             for (const auto & [exp, sl] : lc.exp2slot) {
+                if (reserved_this_call.count(exp)) continue;
                 float sc = s.pred->score(logical, exp);
                 if (sc < best_score) { best_score = sc; best_victim = exp; }
             }
-            if (best_victim < 0) best_victim = lc.lru.back();
+            if (best_victim < 0) {
+                // Fall back to LRU tail, but still skip reserved-this-call.
+                for (auto it = lc.lru.rbegin(); it != lc.lru.rend(); ++it) {
+                    if (!reserved_this_call.count(*it)) { best_victim = *it; break; }
+                }
+            }
+            if (best_victim < 0) {
+                LLAMA_LOG_ERROR("moe_eval_callback: no evictable victim at L%d "
+                        "(n_slots=%u, uniq=%zu, reserved_this_call=%zu). "
+                        "Increase --moe-cache-vram-mb.\n",
+                        logical, s.n_slots, uniq.size(), reserved_this_call.size());
+                GGML_ABORT("MoE-offload: slot pool exhausted by in-flight reservations");
+            }
             lc.lru.erase(lc.lru_it[best_victim]);
             lc.lru_it.erase(best_victim);
             slot = lc.exp2slot[best_victim];
@@ -881,6 +904,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         lc.slot_to_expert[slot] = e;
         lc.exp2slot[e] = slot;
         lru_touch(lc, e);
+        reserved_this_call.insert(e);
         ++s.cache_misses;
         ++misses_loaded;
     }
@@ -1038,7 +1062,21 @@ void slot_pool_init_io(const std::string & source_path) {
     initialized = true;
 
     const manifest & mf = get_manifest();
-    int n_buffers = std::min(std::max((int)(2 * n_slots_per_layer()), 8), 64);
+
+    // Phase L.2: the buffer pool must accommodate the worst-case per-layer
+    // miss demand WITHOUT requiring an intermediate drain, because the
+    // miss-loop currently submits all misses for a layer before draining
+    // any. Worst case = (kMaxStreamingUbatch * top_k_max) unique experts
+    // per layer, each contributing EXPERT_KIND_COUNT (=3) in-flight
+    // requests. Conservative bound is 8 (ubatch cap) * 8 (typical top_k
+    // upper-bound) * 3 = 192. We also keep at least 2x slot count so the
+    // single-token decode path overlaps freely. Cap at 256 to bound pinned
+    // memory cost (~256 * blob_max bytes).
+    constexpr int kMinIoBuffers = 192;
+    constexpr int kMaxIoBuffers = 256;
+    int n_buffers = (int)(2 * n_slots_per_layer());
+    if (n_buffers < kMinIoBuffers) n_buffers = kMinIoBuffers;
+    if (n_buffers > kMaxIoBuffers) n_buffers = kMaxIoBuffers;
     size_t blob_max = mf.expert_blob_size_max > 0 ? mf.expert_blob_size_max : (1024*1024);
 
     LLAMA_LOG_INFO("%s: initializing async I/O worker (n_buffers=%d, blob_max=%zu)\n",
