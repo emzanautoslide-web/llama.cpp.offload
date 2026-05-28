@@ -10,6 +10,8 @@ struct ggml_tensor;
 
 namespace llama_moe {
 
+class profiler;  // forward decl
+
 struct runtime_options {
     bool enabled = false;
     std::string model_path;
@@ -29,6 +31,10 @@ const manifest &        get_manifest();
 
 void begin_request();
 void end_request();
+
+// Phase E: access the global profiler for recording per-layer rows from
+// the eval-callback. Returns nullptr if profiling is not enabled.
+profiler * get_profiler();
 
 ggml_tensor * remap_selected_experts(
         ggml_context * ctx,

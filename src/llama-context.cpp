@@ -1302,6 +1302,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         if (llama_moe::runtime_enabled() && llama_moe::streaming_mode()) {
             ggml_backend_sched_set_eval_callback(sched.get(), llama_moe::moe_eval_callback, nullptr);
+
+            // One-time async I/O init on first graph build in streaming mode.
+            static bool io_inited = false;
+            if (!io_inited) {
+                io_inited = true;
+                llama_moe::slot_pool_init_io(llama_moe::get_manifest().source_path);
+            }
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         }

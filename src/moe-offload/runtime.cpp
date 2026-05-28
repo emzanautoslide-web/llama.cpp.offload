@@ -70,6 +70,9 @@ void begin_request() {
 }
 
 void end_request() {
+    // Phase E-3: let predictor finalize (e.g. EAMC sidecar dump).
+    slot_pool_end_request();
+
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.options.enabled || s.options.profile_summary.empty() || !s.prof) {
@@ -80,6 +83,11 @@ void end_request() {
     if (out) {
         out << s.prof->summary();
     }
+}
+
+profiler * get_profiler() {
+    auto & s = state();
+    return s.prof.get();
 }
 
 ggml_tensor * remap_selected_experts(

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <string>
 
 struct ggml_tensor;
 struct llama_hparams;
@@ -80,6 +81,16 @@ void reset_graph_state();
 // NOT prefetch all experts; instead a per-layer LRU cache fills slots on demand
 // via the eval-callback below.
 bool streaming_mode();
+
+// Phase D-5: initialize the async I/O subsystem. Must be called once after
+// slot tensors have backing buffers. Idempotent (safe to call multiple times).
+void slot_pool_init_io(const std::string & source_path);
+
+// Phase D-5: shutdown the async I/O worker.
+void slot_pool_shutdown_io();
+
+// Phase E-3: end the current request (calls predictor.end_request).
+void slot_pool_end_request();
 
 // Phase D-2: scheduler eval-callback. On post-eval of `ffn_moe_topk-<il>` it
 // reads selected expert IDs, ensures their blobs are resident in slots (loading

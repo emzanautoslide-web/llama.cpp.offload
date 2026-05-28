@@ -1,0 +1,64 @@
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+
+namespace llama_moe {
+
+// ---------------------------------------------------------------------------
+// Threaded I/O pipeline for MoE expert offloading.
+//
+// Architecture:
+//   eval-callback  ──(enqueue)──▶  SPSC ring  ──▶  I/O worker thread
+//                                                      │
+//   ggml_backend_tensor_set ◀─── pinned buffers ◀── fread from disk
+//
+// Flow per missed expert:
+//   1. callback acquires a pinned staging buffer from the pool
+//   2. callback pushes an io_request onto the ring (fread only — no H2D)
+//   3. worker pops the request, freads expert blob into the pinned buffer
+//   4. callback calls io_wait_all() to block until all freads complete
+//   5. callback does ggml_backend_tensor_set from pinned buffers to GPU
+//   6. callback releases pinned buffers back to pool
+//
+// This avoids CUDA stream/event complexity while still overlapping SSD
+// reads across multiple experts via the worker thread.
+// ---------------------------------------------------------------------------
+
+struct io_request {
+    int      layer;        // logical MoE layer index
+    int32_t  expert;       // expert id (0..n_expert-1)
+    int      kind;         // EXPERT_GATE / EXPERT_UP / EXPERT_DOWN
+    int32_t  slot;         // destination slot index
+    void *   pinned_buf;   // pinned host buffer (owned by pool)
+    size_t   blob_size;    // bytes to read
+    uint64_t file_offset;  // absolute byte offset in .moe.gguf
+    char *   gpu_dst;      // GPU destination address (slot_tensor->data + slot * nb[2])
+};
+
+// One-time init.
+// - source_path: path to the .moe.gguf (opened once by the worker)
+// - blob_size_max: largest expert blob in bytes (for pinned buffer sizing)
+// - n_buffers: number of pinned staging buffers in the ring pool
+bool io_init(const char * source_path, size_t blob_size_max, int n_buffers);
+
+// Shut down the worker thread and free all resources.
+void io_shutdown();
+
+// Acquire a pinned staging buffer from the pool. Blocks if none available.
+void * io_acquire_buffer();
+
+// Release a pinned buffer back to the free pool.
+void io_release_buffer(void * buf);
+
+// Enqueue a read request. Returns false if the queue is full.
+bool io_submit(struct io_request req);
+
+// Block until all previously submitted reads are complete.
+// Returns the number of requests drained.
+int io_wait_all();
+
+// Number of outstanding (submitted but not yet waited) requests.
+int io_outstanding();
+
+} // namespace llama_moe

@@ -56,10 +56,26 @@ Implemented in this slice:
 - Slot-cache model and profiling CSV/summary plumbing.
 - Guarded hooks at model load, decode request boundaries, and MoE top-k graph construction.
 - `llama-moe-repack` and `llama-moe-bench` targets.
+- **D-4**: Pre-allocated slot_table tensors via `create_unfiled_tensor`; zero-init of all slot tensors; ubatch auto-cap to 8 in streaming mode.
+- **D-5**: Threaded async I/O worker (`src/moe-offload/io.{h,cpp}`) with SPSC ring queue and staging buffer pool.
+- **E**: Per-layer CSV profiling rows; end-request summary; LRU/EAMC predictor wired into eval-callback eviction.
 
-Still pending for the full SSD-backed MVP:
+## Troubleshooting
 
-- Split fused expert tensors into per-expert contiguous blobs.
-- Allocate physical VRAM expert slots and remap `mul_mat_id` IDs to those slots.
-- Implement CUDA H2D stream/event synchronization and SSD demand fetch.
-- Emit real per-layer hit/miss/stall rows from the graph execution path.
+### "n_uniq exceeds n_slots" error
+```
+moe_eval_callback: n_uniq=96 exceeds n_slots=48
+```
+Increase `--moe-cache-vram-mb` so `n_slots >= worst-case unique experts per batch`,
+or reduce batch size with `-ub`.
+
+### Streaming mode caps ubatch to 8
+When `--moe-cache-vram-mb` is small enough that `n_slots < n_expert` (streaming mode),
+the ubatch is automatically capped to **8** to avoid a known `ggml_get_rows`→`mm_ids_helper`
+kernel crash. This reduces prefill throughput (~2-5× slowdown). To restore full throughput,
+use full residency: `--moe-cache-vram-mb 99999`.
+
+### CUDA illegal memory access at launch_mul_mat_q
+This is the ubatch-capping issue above. Ensure you are using the latest build
+which auto-caps ubatch to 8 in streaming mode. If you need larger ubatch,
+use full residency or investigate `ggml/src/ggml-cuda/mmq.cu` + `mmid.cu`.

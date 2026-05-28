@@ -56,6 +56,7 @@ target_link_libraries(llama PUBLIC ggml)
 if (LLAMA_MOE_OFFLOAD)
     target_sources(llama PRIVATE
         moe-offload/cache.cpp
+        moe-offload/io.cpp
         moe-offload/loader.cpp
         moe-offload/platform_io.cpp
         moe-offload/predictor.cpp
