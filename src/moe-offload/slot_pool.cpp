@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <list>
 #include <mutex>
@@ -461,6 +462,13 @@ bool prefetch_all_experts() {
             if (!slot) {
                 continue; // kind not present (e.g. fused gate_up uses only one slot)
             }
+            if (!slot->buffer) {
+                // Phase M.1: layer's MoE block was not part of any built
+                // compute graph, so the scheduler never bound a backend
+                // buffer. Skip silently — the slot tensor cannot be a
+                // mul_mat_id consumer either.
+                continue;
+            }
             const size_t stride = slot->nb[2];
             for (uint32_t e = 0; e < mf.n_experts_per_layer; ++e) {
                 const expert_record & rec = mf.at(li, e, (expert_kind) k);
@@ -689,6 +697,15 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!t || !t->name[0]) {
         return true;
     }
+    if (std::getenv("LLAMA_MOE_DEBUG_CB_PROOF")) {
+        static int cb_proof_n = 0;
+        if (cb_proof_n < 5) {
+            fprintf(stderr, "[cb-proof] cb#%d ask=%d t=%s\n", cb_proof_n++, (int)ask, t->name);
+        }
+    }
+    if (std::getenv("LLAMA_MOE_DEBUG_CB_NOP")) {
+        return true;
+    }
 
     auto & s = state();
 
@@ -778,11 +795,29 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     // Ensure residency. Process hits first (just touch), then misses (evict + load).
+    int dbg_hits = 0, dbg_misses = 0, dbg_evictions = 0, dbg_free_alloc = 0;
+
+    // Phase M.4 diagnostic: optionally invalidate the cache before this
+    // callback so every uniq expert is treated as a MISS and freshly
+    // re-loaded. If this collapses streaming drift to ~0, the bug is in
+    // how HIT slot data is consumed across callbacks (likely a missing
+    // cross-step H2D-event wait on the compute stream).
+    {
+        static const bool diag_no_hit = std::getenv("LLAMA_MOE_DEBUG_NO_HIT") != nullptr;
+        if (diag_no_hit) {
+            lc.exp2slot.clear();
+            lc.lru.clear();
+            lc.lru_it.clear();
+            std::fill(lc.slot_to_expert.begin(), lc.slot_to_expert.end(), -1);
+        }
+    }
+
     for (int32_t e : uniq) {
         auto it = lc.exp2slot.find(e);
         if (it != lc.exp2slot.end()) {
             lru_touch(lc, e);
             ++s.cache_hits;
+            ++dbg_hits;
         }
     }
 
@@ -809,6 +844,18 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     // the very same forward pass).
     std::unordered_set<int32_t> reserved_this_call;
 
+    // Phase M.3: every expert in `uniq` is a top-k consumer of this very
+    // forward pass — it MUST NOT be evicted by a later miss in the same
+    // callback. Previously only just-loaded misses were protected, which
+    // meant a HIT expert could have its slot stolen; the slot_table fill
+    // below would then read `lc.exp2slot[hit]` (now erased) and silently
+    // default-construct to 0, sending mul_mat_id to the wrong slot. This
+    // produced a deterministic ~0.46 max|Δlogit| drift versus full
+    // residency whenever the cache was small enough to force evictions.
+    for (int32_t e : uniq) {
+        reserved_this_call.insert(e);
+    }
+
     for (int32_t e : uniq) {
         if (lc.exp2slot.count(e)) continue;
 
@@ -817,6 +864,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         for (uint32_t si = 0; si < s.n_slots; ++si) {
             if (lc.slot_to_expert[si] < 0) { slot = (int32_t) si; break; }
         }
+        if (slot >= 0) ++dbg_free_alloc;
         if (slot < 0) {
             // Phase E: use predictor.score for eviction (lower = evict).
             // Phase L.2: skip experts reserved earlier in this same
@@ -846,6 +894,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             slot = lc.exp2slot[best_victim];
             lc.exp2slot.erase(best_victim);
             lc.slot_to_expert[slot] = -1;
+            ++dbg_evictions;
         }
 
         // Phase H: submit one async read per (kind) into the slot's GPU
@@ -883,7 +932,14 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             req.blob_size   = rec.size;
             req.file_offset = mf.data_offset + rec.rel_offset;
             req.gpu_dst     = (char *) slot_tensor->data + write_off;
-            req.h2d         = (s.compute_backend != nullptr);
+            // Phase M.2 diagnostic: optionally disable async H2D so the
+            // worker leaves h2d_event=null and the callback falls back to
+            // sync ggml_backend_tensor_set. If this collapses drift, the
+            // async write path (worker → io_h2d_async_timed) is at fault.
+            {
+                static const bool diag_no_async = std::getenv("LLAMA_MOE_DEBUG_NO_ASYNC") != nullptr;
+                req.h2d         = !diag_no_async && (s.compute_backend != nullptr);
+            }
             req.h2d_event   = nullptr;
             req.h2d_begin_event = nullptr;
             req.ssd_read_us = 0;
@@ -907,6 +963,13 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         reserved_this_call.insert(e);
         ++s.cache_misses;
         ++misses_loaded;
+        ++dbg_misses;
+    }
+
+    if (std::getenv("LLAMA_MOE_DEBUG_EVICT")) {
+        fprintf(stderr, "[evict] tok=%llu L%d uniq=%zu hits=%d misses=%d free_alloc=%d evictions=%d n_slots=%u\n",
+                (unsigned long long) row_token_idx, logical, uniq.size(),
+                dbg_hits, dbg_misses, dbg_free_alloc, dbg_evictions, s.n_slots);
     }
 
     int64_t stall_us = 0;
@@ -962,7 +1025,22 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     // Strategy (D-4): build slot_table host buffer (init 0, set hot entries).
-    std::fill(s.slot_table_host.begin(), s.slot_table_host.end(), 0);
+    // Phase M.5 diagnostic: optionally init to IDENTITY instead of 0 for
+    // non-uniq positions. If the mmq kernel reads slot weights at non-top-k
+    // indices, identity (slot_table[E]=E) routes those reads to slot E, which
+    // is either the cached expert E (good) or zero (initial). Compare with
+    // the default zero-init (which routes all non-uniq reads to slot 0 →
+    // whichever expert is cached there → non-zero garbage contribution).
+    {
+        static const bool diag_id = std::getenv("LLAMA_MOE_DEBUG_ID_FILL") != nullptr;
+        if (diag_id) {
+            for (size_t i = 0; i < s.slot_table_host.size(); ++i) {
+                s.slot_table_host[i] = (int32_t) i;
+            }
+        } else {
+            std::fill(s.slot_table_host.begin(), s.slot_table_host.end(), 0);
+        }
+    }
     for (int32_t e : uniq) {
         s.slot_table_host[(size_t) e] = lc.exp2slot[e];
     }
@@ -975,6 +1053,19 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     if (stt && stt->buffer) {
         ggml_backend_tensor_set(stt, s.slot_table_host.data(), 0,
                                 s.slot_table_host.size() * sizeof(int32_t));
+
+        // Phase M.2 diagnostic: force a full compute-stream drain after the
+        // slot_table write. If this collapses streaming drift to ~0, the bug
+        // is stream-ordering between the slot_table H2D (cudaStreamPerThread)
+        // and the get_rows/mul_mat_id consumers on the compute stream. Gated
+        // on env var so it costs nothing in production.
+        if (s.compute_backend) {
+            static const bool diag_sync = std::getenv("LLAMA_MOE_DEBUG_SYNC") != nullptr;
+            if (diag_sync) {
+                ggml_backend_synchronize(s.compute_backend);
+            }
+        }
+
         if (s.topk_calls < 8) {
             // Log first few callbacks: buffer name, uniq count, first few entries
             const char * bn = ggml_backend_buffer_name(stt->buffer);
