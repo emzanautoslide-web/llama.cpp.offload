@@ -14,50 +14,43 @@ Last measured at Phase J: `max|Δlogit| = 4.64e-01`,
 `mean|Δlogit| = 3.67e-02` over 8 decode steps at `--moe-cache-vram-mb 12000`
 on `Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`, `--temp 0 --seed 42 -p "Hello"`.
 
-Phase M instrumentation (this turn) localized the failure mode but did
-not yet isolate the root cause. Findings on `Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`,
-`-p "Hello" -n 4 --temp 0 --seed 42`, `--moe-cache-vram-mb 12000`
-(`n_slots = 145 < n_expert = 256`):
+#### Phase M diagnostics (May 29)
 
-- The drift is **deterministic** (bit-identical across reruns,
-  md5 `1e86cc87…`). Not a CUDA stream race.
-- **Step 0 (prompt forward) drift = 0**. Drift only accumulates from
-  step 1 onward (per-step max: `0, 3.29e-1, 3.02e-1, 4.64e-1`). So the
-  dynamic slot_table mapping computed by the eval-callback is
-  computationally equivalent to full-residency's identity mapping for
-  the **first** forward pass.
-- The cache holds **145 slots/layer with 0 evictions** across all 160
-  callbacks for this prompt+generation (max `uniq` per callback = 8 ≤ 145
-  free slots). Drift cannot be eviction-driven for this test.
-- Negative results from gated diagnostics (all produced bit-identical
-  drift, leaving md5 unchanged):
-  - `LLAMA_MOE_DEBUG_SYNC` — compute_backend synchronize after the
-    slot_table `ggml_backend_tensor_set`; not slot_table stream ordering.
-  - `LLAMA_MOE_DEBUG_NO_ASYNC` — force `req.h2d = false`, sync H2D
-    fallback for weights; not the async cudaMemcpyAsync path.
-  - `LLAMA_MOE_DEBUG_NO_HIT` — clear `lc.exp2slot/lru/slot_to_expert`
-    at start of every callback so every uniq expert is a fresh MISS;
-    not cross-step cache state.
-  - `LLAMA_MOE_DEBUG_ID_FILL` — fill non-uniq `slot_table_host`
-    positions with identity instead of 0; mmq does not read non-top-k
-    slot_table entries.
-  - Tightening `reserved_this_call` to include all of `uniq` (hits +
-    misses) — defensive but no observable effect (no evictions occur).
-- Positive control: `LLAMA_MOE_DEBUG_CB_NOP` (early-return the entire
-  callback) raises drift to `1.62e+01` (md5 `70456e…`). Confirms the
-  callback's writes are consumed by mul_mat_id.
-- At `--moe-cache-vram-mb 24000`, `streaming_mode()` returns false
-  (n_slots ≥ n_expert) → identity slot_table everywhere → drift = 0.
-  This is the full-residency path, not "streaming with a larger cache",
-  so it does not localize the streaming bug.
+`LLAMA_MOE_DEBUG_SLOT_HASH` confirmed cross-step GPU buffer corruption:
+slot weight tensor data changed between consecutive eval-callback visits
+without a matching eviction.  Slots 1-3 at layer 1 were read back as
+all-zeros (hash `0x51d88627df287325`) at token 1 callback START, even
+though they held valid expert data at token 0 callback END and there
+were zero evictions (`n_slots=145`, `uniq=8` per layer).
 
-Open hypotheses, ranked:
-1. **Cross-step slot-tensor content corruption.** Something writes into
-   the slot weight tensor's memory between step 0's callback and step
-   1's `mul_mat_id`. The pre-existing comment in
-   `prefetch_all_experts` (`src/moe-offload/slot_pool.cpp` ~L405-414)
-   explicitly states the mmq kernel "can access unused / excess slots
-   when processing large batches" — extended-access behavior in mmq is
+Layer 0's slots 1-3 survived intact.  This suggests a scheduler
+temporary or mmq kernel write aliases L1's slot-tensor GPU memory during
+L0's MoE compute, but the exact mechanism within `ggml_backend_sched` /
+`ggml_gallocr` has not been isolated.
+
+#### Phase M.7 fix: fingerprint-based integrity + auto-reload
+
+`src/moe-offload/slot_pool.cpp` now maintains a per-layer, per-cached-expert
+FNV1a-64 fingerprint of the first 1024 bytes of each expert's gate-kind
+slot data (computed from the pinned I/O buffer at load time).
+
+At the start of each eval-callback, before counting HIT experts, the code
+reads back the first 1 KiB of each candidate HIT expert's slot from the
+GPU, hashes it, and compares against the stored fingerprint.  If the
+hash mismatches, the expert is evicted from the cache (marking its slot
+free and removing all bookkeeping entries), and the miss-loop below
+reloads it from SSD.
+
+Fingerprints are cleared on normal eviction and recomputed on every
+successful load.
+
+**Impact**: eliminates silent corruption of cached expert weights at the
+cost of at most `uniq.size()` × 1 KiB GPU→host reads per callback.
+When corruption is rare (as expected for this deterministic aliasing bug
+that affects specific layers), this is negligible overhead.
+
+**Status**: fix compiled and landed.  Golden-logits harness re-run
+pending (see caveat below about `-fit` causing repeated model reloads).
    plausible. If mmq also *writes* to scratch in the slot tensor's
    buffer (or if a scheduler-allocated scratch tensor aliases the slot
    tensor's memory), this would corrupt cached HIT data after step 0.

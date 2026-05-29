@@ -68,6 +68,10 @@ struct slot_pool_state {
         std::unordered_map<int32_t, int32_t> exp2slot;
         std::list<int32_t> lru;                       // front = most-recent expert
         std::unordered_map<int32_t, std::list<int32_t>::iterator> lru_it;
+        // Phase M.7: FNV1a-64 hash of the first 1024 bytes of each cached
+        // expert's slot data (gate kind).  Used to detect cross-step GPU
+        // buffer corruption so we can force a reload.
+        std::unordered_map<int32_t, uint64_t> fingerprints;
     };
     std::vector<layer_cache> cache;
     // Reusable host buffer for slot_table writes (size n_expert).
@@ -751,6 +755,43 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     if (logical < 0 || (size_t) logical >= s.cache.size()) return true;
     auto & lc = s.cache[logical];
 
+    // Phase M.6: read slot hashes at callback START (before any modification).
+    // When set, compare with the END hash saved from the previous visit for
+    // this (layer,slot).  A CHANGED-BEFORE-WRITE tag means the GPU buffer was
+    // corrupted between callbacks (not by us).
+    static const bool diag_slot_start = std::getenv("LLAMA_MOE_DEBUG_SLOT_START") != nullptr;
+    if (diag_slot_start && logical < 3) {
+        constexpr int kMonSlots[] = {0, 1, 2, 3, 8};
+        static uint64_t prev_end_hash[3][5];
+        static bool     prev_end_valid[3][5] = {};
+        ggml_tensor * st = nullptr;
+        for (int k = 0; k < EXPERT_KIND_COUNT; ++k) {
+            if (s.slot_tensors[logical][k]) { st = s.slot_tensors[logical][k]; break; }
+        }
+        if (st && st->buffer) {
+            const size_t buf_sz = ggml_backend_buffer_get_size(st->buffer);
+            const size_t stride = (size_t) st->nb[2];
+            uint8_t buf[1024];
+            for (int si = 0; si < 5; ++si) {
+                int s_idx = kMonSlots[si];
+                if ((uint32_t) s_idx >= s.n_slots) continue;
+                size_t off = (size_t) s_idx * stride;
+                size_t sz  = stride < sizeof(buf) ? stride : sizeof(buf);
+                if (off + sz > buf_sz) continue;
+                ggml_backend_tensor_get(st, buf, off, sz);
+                uint64_t h = 0xcbf29ce484222325ULL;
+                for (size_t i = 0; i < sz; ++i) { h ^= buf[i]; h *= 0x100000001b3ULL; }
+                const char * tag = "";
+                if (prev_end_valid[logical][si] && h != prev_end_hash[logical][si]) {
+                    tag = " CORRUPTED-SINCE-LAST-END";
+                }
+                fprintf(stderr, "[slot-hash-start] tok=%llu L%d slot=%d hash=0x%016llx%s\n",
+                        (unsigned long long) s.token_idx, logical, s_idx,
+                        (unsigned long long) h, tag);
+            }
+        }
+    }
+
     // Read top-k IDs (D2H). Shape: [n_expert_used, n_tokens] I32.
     const int64_t n_elem = ggml_nelements(t);
     const int64_t n_tokens = t->ne[1];
@@ -809,6 +850,58 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             lc.lru.clear();
             lc.lru_it.clear();
             std::fill(lc.slot_to_expert.begin(), lc.slot_to_expert.end(), -1);
+        }
+    }
+
+    // Phase M.7: verify HIT expert slot data integrity.  The GPU buffer that
+    // backs slot tensors can be aliased by scheduler temporaries or mmq
+    // kernel scratch writes during graph execution.  We read back and hash
+    // the first 1 KiB of each HIT expert's gate-kind slot data and compare
+    // against the fingerprint stored after the last successful load.  A
+    // mismatch means the slot was corrupted; we evict the stale entry so
+    // the miss-loop below reloads it from SSD.
+    {
+        ggml_tensor * fp_tensor = s.slot_tensors[logical][EXPERT_GATE];
+        if (fp_tensor && fp_tensor->buffer) {
+            const size_t stride   = (size_t) fp_tensor->nb[2];
+            const size_t buf_size = ggml_backend_buffer_get_size(fp_tensor->buffer);
+            uint8_t fpbuf[1024];
+            size_t sz = stride < sizeof(fpbuf) ? stride : sizeof(fpbuf);
+            std::vector<int32_t> corrupted;
+            for (int32_t e : uniq) {
+                auto it = lc.exp2slot.find(e);
+                if (it == lc.exp2slot.end()) continue; // MISS, no fingerprint to check
+                auto fpit = lc.fingerprints.find(e);
+                if (fpit == lc.fingerprints.end()) continue; // no fingerprint stored yet
+
+                int32_t sl = it->second;
+                size_t off = (size_t) sl * stride;
+                if (off + sz > buf_size) continue;
+                ggml_backend_tensor_get(fp_tensor, fpbuf, off, sz);
+                uint64_t h = 0xcbf29ce484222325ULL;
+                for (size_t i = 0; i < sz; ++i) { h ^= fpbuf[i]; h *= 0x100000001b3ULL; }
+                if (h != fpit->second) {
+                    corrupted.push_back(e);
+                }
+            }
+            if (!corrupted.empty()) {
+                static int fp_corrupt_log = 0;
+                for (int32_t e : corrupted) {
+                    auto it = lc.exp2slot.find(e);
+                    if (it != lc.exp2slot.end()) {
+                        lc.slot_to_expert[it->second] = -1;
+                        auto lru_it = lc.lru_it.find(e);
+                        if (lru_it != lc.lru_it.end()) { lc.lru.erase(lru_it->second); lc.lru_it.erase(lru_it); }
+                        lc.exp2slot.erase(it);
+                        lc.fingerprints.erase(e);
+                    }
+                    if (fp_corrupt_log < 10) {
+                        fprintf(stderr, "[fp-corrupt] tok=%llu L%d expert=%d fingerprint mismatch — forcing reload\n",
+                                (unsigned long long) row_token_idx, logical, e);
+                        ++fp_corrupt_log;
+                    }
+                }
+            }
         }
     }
 
@@ -893,6 +986,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             lc.lru_it.erase(best_victim);
             slot = lc.exp2slot[best_victim];
             lc.exp2slot.erase(best_victim);
+            lc.fingerprints.erase(best_victim);
             lc.slot_to_expert[slot] = -1;
             ++dbg_evictions;
         }
@@ -1016,6 +1110,19 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 }
             }
 
+            // Phase M.7: fingerprint the loaded data for cross-step
+            // integrity verification.  We hash the first 1 KiB of the
+            // pinned buffer (which holds the source expert blob).  Only
+            // fingerprint the GATE kind so the verification read-back
+            // touches just one tensor per layer.
+            if (c.kind == EXPERT_GATE && c.blob_size > 0) {
+                size_t fp_sz = c.blob_size < 1024 ? (size_t) c.blob_size : 1024;
+                uint64_t fp = 0xcbf29ce484222325ULL;
+                const uint8_t * src = (const uint8_t *) c.pinned_buf;
+                for (size_t i = 0; i < fp_sz; ++i) { fp ^= src[i]; fp *= 0x100000001b3ULL; }
+                lc.fingerprints[c.expert] = fp;
+            }
+
             io_release_buffer(c.pinned_buf);
         }
 
@@ -1128,6 +1235,48 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
         s.pending_rows.push_back(std::move(p));
         s.last_pending_idx = (int) s.pending_rows.size() - 1;
+    }
+
+    // Phase M.6 diagnostic: content-hash slots after the callback has finished
+    // all writes.  Compares against the saved END hash from the *previous*
+    // callback visit for the same (layer, slot).  If a slot changed WITHOUT an
+    // eviction, the GPU buffer is being aliased or overwritten between callbacks.
+    static const bool diag_slot_hash = std::getenv("LLAMA_MOE_DEBUG_SLOT_HASH") != nullptr;
+    if (diag_slot_hash && logical < 3) {
+        constexpr int kMonSlots[] = {0, 1, 2, 3, 8};
+        constexpr int kMonCount   = 5;
+        // saved END hash from the previous time this (layer,slot) was visited
+        static uint64_t prev_hash[3][kMonCount];
+        static bool     prev_hash_valid[3][kMonCount] = {};
+
+        ggml_tensor * st_for_read = nullptr;
+        for (int k = 0; k < EXPERT_KIND_COUNT; ++k) {
+            if (s.slot_tensors[logical][k]) { st_for_read = s.slot_tensors[logical][k]; break; }
+        }
+        if (st_for_read && st_for_read->buffer) {
+            const size_t buf_size = ggml_backend_buffer_get_size(st_for_read->buffer);
+            const size_t stride   = (size_t) st_for_read->nb[2];
+            uint8_t buf[1024];
+            for (int si = 0; si < kMonCount; ++si) {
+                int s_idx = kMonSlots[si];
+                if ((uint32_t) s_idx >= s.n_slots) continue;
+                size_t off = (size_t) s_idx * stride;
+                size_t sz  = stride < sizeof(buf) ? stride : sizeof(buf);
+                if (off + sz > buf_size) continue;
+                ggml_backend_tensor_get(st_for_read, buf, off, sz);
+                uint64_t hash = 0xcbf29ce484222325ULL;
+                for (size_t i = 0; i < sz; ++i) { hash ^= buf[i]; hash *= 0x100000001b3ULL; }
+                const char * tag = "";
+                if (prev_hash_valid[logical][si] && hash != prev_hash[logical][si]) {
+                    tag = " CHANGED-SINCE-LAST";
+                }
+                fprintf(stderr, "[slot-hash-end] tok=%llu L%d slot=%d hash=0x%016llx%s\n",
+                        (unsigned long long) row_token_idx, logical, s_idx,
+                        (unsigned long long) hash, tag);
+                prev_hash[logical][si]       = hash;
+                prev_hash_valid[logical][si] = true;
+            }
+        }
     }
 
     if ((uint32_t) logical + 1 == mf.n_layers) {
