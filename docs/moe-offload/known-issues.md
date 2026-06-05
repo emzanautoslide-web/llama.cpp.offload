@@ -44,36 +44,39 @@ reloads it from SSD.
 Fingerprints are cleared on normal eviction and recomputed on every
 successful load.
 
-**Impact**: eliminates silent corruption of cached expert weights at the
-cost of at most `uniq.size()` × 1 KiB GPU→host reads per callback.
-When corruption is rare (as expected for this deterministic aliasing bug
-that affects specific layers), this is negligible overhead.
+#### Phase M.8 results (May 29)
 
-**Status**: fix compiled and landed.  Golden-logits harness re-run
-pending (see caveat below about `-fit` causing repeated model reloads).
-   plausible. If mmq also *writes* to scratch in the slot tensor's
-   buffer (or if a scheduler-allocated scratch tensor aliases the slot
-   tensor's memory), this would corrupt cached HIT data after step 0.
-2. **mmq kernel reads quantized scales from a per-expert layout
-   keyed by the slot index passed in.** Reading `slot_tensor[S]` may
-   resolve scales from an offset table indexed by S; if step 1 routes
-   the same expert to a different `S` than the contiguous step-0 layout,
-   the kernel may compute slightly different rounding. Step 0 = 0 drift
-   would then be a coincidence of cold-cache slot order. (Less likely.)
-3. **Graph topology divergence at step 1+.** Some downstream node
-   reads slot data differently across forward passes. Unlikely because
-   full residency uses the same graph wiring.
+Streaming run (`--moe-cache-vram-mb 12000`, `-n 8`) with
+`LLAMA_MOE_DEBUG_EVICT=1 LLAMA_MOE_DEBUG_SLOT_HASH=1`:
 
-Next concrete diagnostic (not yet implemented): at end of each callback,
-read back via `ggml_backend_tensor_get` a content hash of the slot
-tensor's first 1 KiB at slot 0/1/2/3, and the host
-`slot_table_host[:32]`. Run for 4 tokens; compare per-(token,layer)
-records to see whether slot 0 content changes between callbacks
-without being written by `tensor_set`/`io_h2d`. If yes → hypothesis 1
-confirmed.
+- **10 fp-corrupt events** detected across 8 tokens × 40 layers = 320
+  callbacks. The fingerprint verification is working and catches real
+  GPU buffer corruption.
+- **Repeated corruption on same experts**: L12 expert=0 corrupted at
+  tokens 2,3,4,5; L0 expert=238 corrupted at tokens 2,3. After
+  reloading, the expert's data is corrupted AGAIN during the current
+  forward pass' graph execution — the `mul_mat_id` consumer reads
+  corrupted data before the next callback can detect and fix it.
+- **Generated output is `Hello,///////`** — identical garbage to the
+  full-residency run. The fingerprint fix detects corruption but cannot
+  prevent it from affecting the current forward pass.
 
-Gate harness: `tests/moe-offload/test-golden-logits.ps1`
-(+ `compare_logits.py`). Now usable after the prefetch crash fix below.
+**Conclusion**: The corruption happens WITHIN a single forward pass
+(during graph execution, between callback return and `mul_mat_id`
+consumption). The fingerprint + auto-reload approach can only fix data
+for the NEXT token, not the current one. A full fix requires preventing
+the corruption at the source, which is suspected to be either:
+1. Cross-layer MMQ kernel buffer overflow (L11 corrupts L12)
+2. Scheduler temporary aliasing within the same GPU buffer
+
+#### Mitigation status
+
+- ✅ Corruption **detected** (fingerprint verification catches it)
+- ✅ Corrupted data **reloaded** (eviction + SSD reload on next callback)
+- ❌ Current token **not protected** (corruption happens after reload,
+  during same forward pass)
+- Full fix requires dedicated GPU buffers per layer or MMQ kernel
+  analysis — **deferred to post-MVP**.
 
 ### Streaming `n_ubatch` capped to 8
 
