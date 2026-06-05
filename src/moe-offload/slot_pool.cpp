@@ -192,6 +192,9 @@ void configure_slot_pool() {
     predictor_kind pk = predictor_kind::lru;
     try { pk = parse_predictor_kind(opts.predictor); } catch (...) {}
     s.pred = make_predictor(pk, (int) mf.n_layers, (int) mf.n_experts_per_layer);
+    if (pk == predictor_kind::eamc && !opts.eamc_path.empty()) {
+        s.pred->load(opts.eamc_path);
+    }
     s.pred->begin_request();
 
     s.configured = true;
@@ -292,19 +295,23 @@ ggml_tensor * intercept_expert_tensor(
     const int64_t d_in  = ne.begin()[0];
     const int64_t d_out = ne.begin()[1];
 
-    // Always allocate the slot tensor with the original expert count (n_expert)
-    // as ne[2]. The mmq kernel used by mul_mat_id can crash with non-standard
-    // expert counts. The cache still manages only n_slots experts;
-    // unused slots [n_slots, n_expert-1] are never accessed because the
-    // remap maps expert IDs strictly into [0, n_slots-1].
     const int64_t n_expert = ne.begin()[2];
-    (void) n_slots; // usable cache size; expert axis must stay at n_expert for mmq
+    const bool full_axis_guard = std::getenv("LLAMA_MOE_FULL_EXPERT_AXIS") != nullptr;
+    const int64_t n_slot_axis = full_axis_guard ? n_expert : (int64_t) n_slots;
+    if (full_axis_guard) {
+        static bool warned = false;
+        if (!warned) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_FULL_EXPERT_AXIS is set; slot tensors use original expert axis as a guarded fallback\n",
+                    __func__);
+            warned = true;
+        }
+    }
 
     const std::string slot_name = src_name + ".slot";
 
     ggml_tensor * slot = ml.create_unfiled_tensor(
             hparams, buft_list_layer, slot_name, src_meta->type,
-            GGML_OP_MUL_MAT_ID, { d_in, d_out, n_expert });
+            GGML_OP_MUL_MAT_ID, { d_in, d_out, n_slot_axis });
 
     if (!slot) {
         throw std::runtime_error("intercept_expert_tensor: create_unfiled_tensor returned null");
@@ -811,10 +818,15 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         if (e >= 0 && (uint32_t) e < mf.n_experts_per_layer) uniq.insert(e);
     }
 
+    int64_t pred_us = 0;
+
     // Phase E-3: observe expert usage for predictor.
     {
         std::vector<int> obs(uniq.begin(), uniq.end());
+        const auto pred_start = std::chrono::steady_clock::now();
         s.pred->observe(logical, obs);
+        const auto pred_end = std::chrono::steady_clock::now();
+        pred_us += elapsed_us(pred_start, pred_end);
     }
 
     // Architectural constraint: all unique experts selected this batch must fit
@@ -964,11 +976,14 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             // callback — their slots hold in-flight H2D data.
             float best_score = 1e30f;
             int32_t best_victim = -1;
+            const auto pred_start = std::chrono::steady_clock::now();
             for (const auto & [exp, sl] : lc.exp2slot) {
                 if (reserved_this_call.count(exp)) continue;
                 float sc = s.pred->score(logical, exp);
                 if (sc < best_score) { best_score = sc; best_victim = exp; }
             }
+            const auto pred_end = std::chrono::steady_clock::now();
+            pred_us += elapsed_us(pred_start, pred_end);
             if (best_victim < 0) {
                 // Fall back to LRU tail, but still skip reserved-this-call.
                 for (auto it = lc.lru.rbegin(); it != lc.lru.rend(); ++it) {
@@ -1214,6 +1229,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         // Phase H: stall_us is the host-measured wall-clock around the
         // io_compute_wait drain.
         p.row.stall_us = stall_us;
+        p.row.pred_us = pred_us;
         p.row.ssd_bytes = layer_load_stats.ssd_bytes;
         p.row.ssd_reads = layer_load_stats.ssd_reads;
         p.row.cache_resident_experts = (int) lc.exp2slot.size();
@@ -1398,6 +1414,10 @@ void slot_pool_end_request() {
 
     if (s.pred) {
         s.pred->end_request();
+        const runtime_options & opts = get_options();
+        if (std::strcmp(s.pred->name(), "eamc") == 0 && !opts.eamc_path.empty()) {
+            s.pred->save(opts.eamc_path);
+        }
     }
 }
 

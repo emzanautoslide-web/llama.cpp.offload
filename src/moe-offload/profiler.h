@@ -19,6 +19,7 @@ struct profile_row {
     int64_t h2d_us = 0;
     int64_t compute_us = 0;
     int64_t stall_us = 0;
+    int64_t pred_us = 0;
     uint64_t ssd_bytes = 0;
     uint64_t ssd_reads = 0;
     int cache_resident_experts = 0;
@@ -36,6 +37,7 @@ struct profile_phase_stats {
     int64_t h2d_us = 0;
     int64_t compute_us = 0;
     int64_t stall_us = 0;
+    int64_t pred_us = 0;
     int cache_resident_peak = 0;
 };
 

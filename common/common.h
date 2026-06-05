@@ -562,6 +562,7 @@ struct common_params {
     int32_t     moe_cache_vram_mb      = 0;
     float       moe_cache_vram_frac    = 0.0f;
     std::string moe_predictor          = "lru";
+    std::string moe_eamc_path          = "";
     std::string moe_profile_csv        = "";
     std::string moe_profile_summary    = "";
     bool        moe_oracle             = false;

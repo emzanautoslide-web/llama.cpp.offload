@@ -2309,6 +2309,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-eamc-path"}, "PATH",
+        "load/save EAMC predictor sidecar at PATH (default: model path with .eamc)",
+        [](common_params & params, const std::string & value) {
+            params.moe_eamc_path = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-profile-csv"}, "PATH",
         "write per-layer MoE offload profiling rows to PATH",
         [](common_params & params, const std::string & value) {

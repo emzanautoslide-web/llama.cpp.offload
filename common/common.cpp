@@ -1538,6 +1538,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
 #ifdef LLAMA_MOE_OFFLOAD
     mparams.moe_predictor       = params.moe_predictor.c_str();
+    mparams.moe_eamc_path       = params.moe_eamc_path.empty() ? nullptr : params.moe_eamc_path.c_str();
     mparams.moe_profile_csv     = params.moe_profile_csv.empty() ? nullptr : params.moe_profile_csv.c_str();
     mparams.moe_profile_summary = params.moe_profile_summary.empty() ? nullptr : params.moe_profile_summary.c_str();
     mparams.moe_cache_vram_mb   = params.moe_cache_vram_mb < 0 ? 0 : (uint64_t) params.moe_cache_vram_mb;

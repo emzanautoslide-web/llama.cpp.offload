@@ -24,6 +24,8 @@ public:
     virtual void observe(int layer, const std::vector<int> & experts_used) = 0;
     virtual float score(int layer, int expert) const = 0;
     virtual void end_request() = 0;
+    virtual bool load(const std::string & path);
+    virtual bool save(const std::string & path) const;
 };
 
 std::unique_ptr<predictor> make_predictor(

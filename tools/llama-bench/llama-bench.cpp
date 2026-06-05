@@ -339,6 +339,7 @@ struct cmd_params {
     int                              moe_cache_vram_mb;
     float                            moe_cache_vram_frac;
     std::string                      moe_predictor;
+    std::string                      moe_eamc_path;
     std::string                      moe_profile_csv;
     std::string                      moe_profile_summary;
     bool                             moe_oracle;
@@ -392,6 +393,7 @@ static const cmd_params cmd_params_defaults = {
     /* moe_cache_vram_mb    */ 0,
     /* moe_cache_vram_frac  */ 0.0f,
     /* moe_predictor        */ "lru",
+    /* moe_eamc_path        */ "",
     /* moe_profile_csv      */ "",
     /* moe_profile_summary  */ "",
     /* moe_oracle           */ false,
@@ -471,6 +473,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --moe-cache-vram-mb <n>                     expert cache VRAM budget in MiB (default: %d)\n", cmd_params_defaults.moe_cache_vram_mb);
     printf("  --moe-cache-vram-frac <f>                   expert cache fraction of free VRAM (default: %.2f)\n", (double) cmd_params_defaults.moe_cache_vram_frac);
     printf("  --moe-predictor <lru|eamc>                  expert cache predictor (default: %s)\n", cmd_params_defaults.moe_predictor.c_str());
+    printf("  --moe-eamc-path <path>                      load/save EAMC predictor sidecar at path\n");
     printf("  --moe-profile-csv <path>                    write MoE profiling CSV\n");
     printf("  --moe-profile-summary <path>                write MoE profiling summary\n");
     printf("  --moe-oracle                                enable MoE oracle diagnostic mode\n");
@@ -779,6 +782,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
+            } else if (arg == "--moe-eamc-path") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_eamc_path = argv[i];
             } else if (arg == "--moe-profile-csv") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1215,6 +1224,7 @@ struct cmd_params_instance {
     int                moe_cache_vram_mb;
     float              moe_cache_vram_frac;
     std::string        moe_predictor;
+    std::string        moe_eamc_path;
     std::string        moe_profile_csv;
     std::string        moe_profile_summary;
     bool               moe_oracle;
@@ -1252,6 +1262,7 @@ struct cmd_params_instance {
         mparams.moe_cache_vram_mb   = moe_cache_vram_mb < 0 ? 0 : (uint64_t) moe_cache_vram_mb;
         mparams.moe_cache_vram_frac = moe_cache_vram_frac;
         mparams.moe_predictor       = moe_predictor.c_str();
+        mparams.moe_eamc_path       = moe_eamc_path.empty() ? nullptr : moe_eamc_path.c_str();
         mparams.moe_profile_csv     = moe_profile_csv.empty() ? nullptr : moe_profile_csv.c_str();
         mparams.moe_profile_summary = moe_profile_summary.empty() ? nullptr : moe_profile_summary.c_str();
         mparams.moe_oracle          = moe_oracle;
@@ -1307,6 +1318,7 @@ struct cmd_params_instance {
                moe_cache_vram_mb == other.moe_cache_vram_mb &&
                moe_cache_vram_frac == other.moe_cache_vram_frac &&
                moe_predictor == other.moe_predictor &&
+               moe_eamc_path == other.moe_eamc_path &&
                moe_profile_csv == other.moe_profile_csv &&
                moe_profile_summary == other.moe_profile_summary &&
                moe_oracle == other.moe_oracle &&
@@ -1388,6 +1400,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_cache_vram_mb   = */ params.moe_cache_vram_mb,
                 /* .moe_cache_vram_frac = */ params.moe_cache_vram_frac,
                 /* .moe_predictor       = */ params.moe_predictor,
+                /* .moe_eamc_path       = */ params.moe_eamc_path,
                 /* .moe_profile_csv     = */ params.moe_profile_csv,
                 /* .moe_profile_summary = */ params.moe_profile_summary,
                 /* .moe_oracle          = */ params.moe_oracle,
@@ -1434,6 +1447,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_cache_vram_mb   = */ params.moe_cache_vram_mb,
                 /* .moe_cache_vram_frac = */ params.moe_cache_vram_frac,
                 /* .moe_predictor       = */ params.moe_predictor,
+                /* .moe_eamc_path       = */ params.moe_eamc_path,
                 /* .moe_profile_csv     = */ params.moe_profile_csv,
                 /* .moe_profile_summary = */ params.moe_profile_summary,
                 /* .moe_oracle          = */ params.moe_oracle,
@@ -1480,6 +1494,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_cache_vram_mb   = */ params.moe_cache_vram_mb,
                 /* .moe_cache_vram_frac = */ params.moe_cache_vram_frac,
                 /* .moe_predictor       = */ params.moe_predictor,
+                /* .moe_eamc_path       = */ params.moe_eamc_path,
                 /* .moe_profile_csv     = */ params.moe_profile_csv,
                 /* .moe_profile_summary = */ params.moe_profile_summary,
                 /* .moe_oracle          = */ params.moe_oracle,

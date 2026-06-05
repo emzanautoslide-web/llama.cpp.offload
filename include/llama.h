@@ -318,6 +318,7 @@ extern "C" {
     #ifdef LLAMA_MOE_OFFLOAD
         // MoE expert offloading parameters. Only available when built with LLAMA_MOE_OFFLOAD.
         const char * moe_predictor;
+        const char * moe_eamc_path;
         const char * moe_profile_csv;
         const char * moe_profile_summary;
         uint64_t     moe_cache_vram_mb;

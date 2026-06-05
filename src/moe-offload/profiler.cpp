@@ -59,6 +59,7 @@ void profiler::record(const profile_row & row) {
     stats.h2d_us += row.h2d_us;
     stats.compute_us += row.compute_us;
     stats.stall_us += row.stall_us;
+    stats.pred_us += row.pred_us;
     if (row.cache_resident_experts > stats.cache_resident_peak) {
         stats.cache_resident_peak = row.cache_resident_experts;
     }
@@ -74,6 +75,7 @@ void profiler::record(const profile_row & row) {
             << row.h2d_us << ','
             << row.compute_us << ','
             << row.stall_us << ','
+            << row.pred_us << ','
             << row.cache_resident_experts << ','
             << row.predictor << '\n';
     }
@@ -110,6 +112,7 @@ std::string profiler::summary() const {
     out << "h2d_us: " << stats.h2d_us << '\n';
     out << "compute_us: " << stats.compute_us << '\n';
     out << "stall_us: " << stats.stall_us << '\n';
+    out << "pred_us: " << stats.pred_us << '\n';
     return out.str();
 }
 
@@ -167,7 +170,9 @@ std::string format_summary(
     out << "  gpu_compute    " << std::setw(8)
         << us_per_token_ms(profile.decode.compute_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
     out << "  stall (overlap loss) " << std::setw(8)
-        << us_per_token_ms(profile.decode.stall_us, ctx.n_gen, ctx.n_repeat) << " ms\n\n";
+        << us_per_token_ms(profile.decode.stall_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  predictor      " << std::setw(8)
+        << us_per_token_ms(profile.decode.pred_us, ctx.n_gen, ctx.n_repeat) << " ms\n\n";
 
     out << "VRAM peak: " << std::setprecision(2) << vram_peak_gib << " GB";
     if (ctx.vram_total_bytes > 0) {
@@ -194,6 +199,7 @@ profile_phase_stats profiler::total() const {
     stats.h2d_us = prefill_stats.h2d_us + decode_stats.h2d_us;
     stats.compute_us = prefill_stats.compute_us + decode_stats.compute_us;
     stats.stall_us = prefill_stats.stall_us + decode_stats.stall_us;
+    stats.pred_us = prefill_stats.pred_us + decode_stats.pred_us;
     stats.cache_resident_peak = prefill_stats.cache_resident_peak > decode_stats.cache_resident_peak
         ? prefill_stats.cache_resident_peak
         : decode_stats.cache_resident_peak;
@@ -201,7 +207,7 @@ profile_phase_stats profiler::total() const {
 }
 
 void profiler::write_header() {
-    csv << "token_idx,phase,layer,k_required,k_hit,k_miss,ssd_read_us,h2d_us,compute_us,stall_us,cache_resident_experts,predictor\n";
+    csv << "token_idx,phase,layer,k_required,k_hit,k_miss,ssd_read_us,h2d_us,compute_us,stall_us,pred_us,cache_resident_experts,predictor\n";
 }
 
 } // namespace llama_moe

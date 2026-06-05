@@ -40,6 +40,7 @@ struct bench_params {
     int n_repeat = 3;
     int moe_cache_mb = 8000;
     std::string moe_predictor = "eamc";
+    std::string moe_eamc_path;
     std::string moe_profile_csv;
     std::string moe_profile_summary;
     int n_gpu_layers = 99;
@@ -76,6 +77,7 @@ static bool parse_args(int argc, char ** argv, bench_params & p) {
         else if (int_for("--repeat", p.n_repeat)) {}
         else if (int_for("--moe-cache-vram-mb", p.moe_cache_mb)) {}
         else if (value_for("--moe-predictor", p.moe_predictor)) {}
+        else if (value_for("--moe-eamc-path", p.moe_eamc_path)) {}
         else if (value_for("--moe-profile-csv", p.moe_profile_csv)) {}
         else if (value_for("--moe-profile-summary", p.moe_profile_summary)) {}
         else if (int_for("-ngl", p.n_gpu_layers)) {}
@@ -226,7 +228,8 @@ static std::string build_summary(
     out << "  ssd_read       " << std::setw(8) << std::setprecision(2) << us_per_token_ms(profile.decode.ssd_read_us, p.n_gen, p.n_repeat) << " ms\n";
     out << "  h2d            " << std::setw(8) << us_per_token_ms(profile.decode.h2d_us, p.n_gen, p.n_repeat) << " ms\n";
     out << "  gpu_compute    " << std::setw(8) << us_per_token_ms(profile.decode.compute_us, p.n_gen, p.n_repeat) << " ms\n";
-    out << "  stall (overlap loss) " << std::setw(8) << us_per_token_ms(profile.decode.stall_us, p.n_gen, p.n_repeat) << " ms\n\n";
+    out << "  stall (overlap loss) " << std::setw(8) << us_per_token_ms(profile.decode.stall_us, p.n_gen, p.n_repeat) << " ms\n";
+    out << "  predictor      " << std::setw(8) << us_per_token_ms(profile.decode.pred_us, p.n_gen, p.n_repeat) << " ms\n\n";
 
     out << "VRAM peak: " << std::setprecision(2) << vram_peak_gib << " GB";
     if (vram_total_bytes > 0) {
@@ -259,7 +262,7 @@ static llama_token greedy_token(llama_context * ctx, int vocab_size) {
 int main(int argc, char ** argv) {
     bench_params p;
     if (!parse_args(argc, argv, p)) {
-        fprintf(stderr, "Usage: llama-moe-bench --model <path> --pp N --tg N [--repeat N] [--moe-cache-vram-mb MB] [--moe-predictor lru|eamc] [--moe-profile-csv PATH] [--moe-profile-summary PATH]\n");
+        fprintf(stderr, "Usage: llama-moe-bench --model <path> --pp N --tg N [--repeat N] [--moe-cache-vram-mb MB] [--moe-predictor lru|eamc] [--moe-eamc-path PATH] [--moe-profile-csv PATH] [--moe-profile-summary PATH]\n");
         return 1;
     }
 
@@ -282,6 +285,7 @@ int main(int argc, char ** argv) {
     model_params.moe_offload = true;
     model_params.moe_cache_vram_mb = (uint64_t) p.moe_cache_mb;
     model_params.moe_predictor = p.moe_predictor.c_str();
+    model_params.moe_eamc_path = p.moe_eamc_path.empty() ? nullptr : p.moe_eamc_path.c_str();
     model_params.moe_profile_csv = p.moe_profile_csv.empty() ? nullptr : p.moe_profile_csv.c_str();
     // The runtime end_request() summary writer emits the legacy aggregate
     // format. llama-moe-bench owns --moe-profile-summary so it can write the

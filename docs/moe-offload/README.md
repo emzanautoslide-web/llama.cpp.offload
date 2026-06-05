@@ -18,7 +18,7 @@ build-moe/bin/llama-moe-repack \
   --manifest C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf.json
 ```
 
-The current repacker writes a stock-loadable GGUF with page-aligned tensor data and `moe_offload.*` metadata. It records the layout as `fused-tensors-page-aligned-v0`; fused expert tensors are not split into per-expert contiguous blobs yet.
+The current repacker writes a stock-loadable GGUF with page-aligned tensor data and `moe_offload.*` metadata. It records the layout as `fused-tensors-page-aligned-v1`: the original fused expert tensors remain in the file, and `moe_offload.expert_blob.table` records each `(logical_layer, expert, kind)` byte range relative to the GGUF data section.
 
 ## Run
 
@@ -31,7 +31,7 @@ The current repacker writes a stock-loadable GGUF with page-aligned tensor data 
   -p "Hello" -n 32
 ```
 
-`--moe-predictor` accepts `lru` or `eamc`. `--moe-profile-csv PATH` and `--moe-profile-summary PATH` write profiling data.
+`--moe-predictor` accepts `lru` or `eamc`. `--moe-eamc-path PATH` selects the EAMC predictor sidecar; when omitted with `--moe-predictor eamc`, the runtime uses the model path with a `.eamc` suffix. `--moe-profile-csv PATH` and `--moe-profile-summary PATH` write profiling data.
 
 ## Bench
 
@@ -40,6 +40,7 @@ The current repacker writes a stock-loadable GGUF with page-aligned tensor data 
   --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
   --pp 1024 --tg 256 --repeat 3 `
   --moe-cache-vram-mb 8000 --moe-predictor eamc `
+  --moe-eamc-path C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.eamc `
   --moe-profile-csv moe-profile.csv `
   --moe-profile-summary moe-summary.txt
 ```
@@ -75,6 +76,7 @@ I/O breakdown (decode, mean per token):
   h2d                7.80 ms
   gpu_compute        0.00 ms
   stall (overlap loss)     29.30 ms
+  predictor          0.04 ms
 
 VRAM peak: 14.80 GB / 15.92 GB  (experts budget: 7.81 GB, other model/kv/compute: 6.99 GB)
 DRAM peak (process): 1.40 GB
@@ -95,7 +97,8 @@ CSV columns:
 | `ssd_read_us` | Wall microseconds spent in `fread` for misses (worker-thread-measured). |
 | `h2d_us` | Microseconds spent in host→device copy. On the CUDA async path this is the sum of `cudaEventElapsedTime` between the per-blob begin/end events recorded on the dedicated MoE H2D stream; on the sync fallback it is host-measured around `ggml_backend_tensor_set`. Mixed contribution per row when both paths fire. |
 | `compute_us` | CUDA-event-timed compute interval for the layer, derived from begin/end events recorded on the compute stream and queried at `slot_pool_end_request()`. Each row's interval brackets the slot_table write of layer L through the topk callback of layer L+1 (or `end_request` for the final layer); this is an over-approximation that includes layer L's MoE compute plus the following attention block. |
-| `stall_us` | Host wall-clock around the miss-completion drain (Phase H). Not the precise compute-stream wait loss; the source plan accepted this approximation. |
+| `stall_us` | Host wall-clock around miss completion and compute-stream wait insertion for miss events. This is still an approximation of overlap loss, not a pure CUDA event duration. |
+| `pred_us` | Host microseconds spent in predictor `observe()` plus eviction `score()` calls for this row. |
 | `cache_resident_experts` | Number of experts resident for the layer after miss handling. |
 | `predictor` | `lru` or `eamc`. |
 
@@ -104,10 +107,10 @@ CSV columns:
 Implemented in this slice:
 
 - `LLAMA_MOE_OFFLOAD` build option.
-- Guarded CLI/model parameters: `--moe-offload`, cache budget knobs, predictor choice, profile paths, oracle flag.
+- Guarded CLI/model parameters: `--moe-offload`, cache budget knobs, predictor choice, EAMC sidecar path, profile paths, and oracle fail-fast.
 - Loader metadata validation for `moe_offload.version`.
-- LRU and EAMC predictor implementations.
-- Slot-cache model and profiling CSV/summary plumbing.
+- LRU and EAMC predictor implementations, including binary EAMC sidecar save/load.
+- Slot-cache model and profiling CSV/summary plumbing, including `pred_us` predictor overhead.
 - Guarded hooks at model load, decode request boundaries, and MoE top-k graph construction.
 - `llama-moe-repack` and `llama-moe-bench` targets.
 - **D-4**: Pre-allocated slot_table tensors via `create_unfiled_tensor`; zero-init of all slot tensors; ubatch auto-cap to 8 in streaming mode.
@@ -118,7 +121,8 @@ Implemented in this slice:
 - **H**: Eval-callback rewired to async H2D via `io_h2d_async_timed` + `io_compute_wait` (`cudaStreamWaitEvent` on the compute stream). Synchronous double-read of the miss blob removed.
 - **I**: Real `compute_us` via CUDA events. Profile rows are buffered per `llama_decode` batch and flushed at `slot_pool_end_request()` after `cudaEventElapsedTime` queries. Per-miss `h2d_us` now comes from event timing on the async path.
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
-- **K**: Three C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`) alongside Phase G's `test-cuda-stream` smoke. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
+- **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
+- **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. CUDA `MUL_MAT_ID` on `.slot` tensors bypasses the specialized MMVQ/MMQ/MMF paths and uses the generic sorted path for correctness-first validation.
 - **L**: IO worker shutdown wired into `llama_context::~llama_context()`; small-cache (≤8000 MiB) and multi-token-prompt streaming deadlocks fixed by enlarging the IO buffer pool to cover worst-case in-flight misses and by excluding just-reserved experts from LRU/predictor eviction within the same callback.
 
 ## Correctness
@@ -170,7 +174,11 @@ but that alone did not move the measured drift. Remaining hypotheses:
   before the current layer's mul_mat_id runs (callback ordering vs.
   scheduler topology).
 
-Tracking this drift to zero is on the Phase L / post-MVP hygiene list.
+The June 5 closeout changes address the two leading runtime suspects from this
+section: slot tensors now use the actual cache slot count by default, and CUDA
+`MUL_MAT_ID` on `.slot` tensors bypasses the specialized MMVQ/MMQ/MMF paths.
+The historical drift number above remains in the document until the dev-box
+golden-logit harness is rerun against the new build.
 
 Deviations from the source plan (`implementation_plan_mvp_20260529.md` §3):
 
@@ -197,14 +205,16 @@ Deviations from the source plan (`implementation_plan_mvp_20260529.md` §3):
 
 ## Test surface
 
-CTest targets under label `moe-offload` (4 tests, all pass on the dev box):
+CTest targets under label `moe-offload`:
 
 | Test | Phase | Purpose |
 |---|---|---|
 | `test-cuda-stream` | G | Pinned alloc + async H2D + event ordering smoke. |
-| `test-eamc-cosine` | K | EAMC cosine ordering and redundancy replacement on full insert. |
+| `test-eamc-cosine` | K | EAMC cosine ordering, sidecar round-trip, and redundancy replacement on full insert. |
 | `test-lru-eviction` | K | Hand-computed LRU score values, victim ordering, per-layer isolation. |
 | `test-manifest-roundtrip` | K | GGUF manifest sanity (version=2, table size, per-record file ranges). Self-skips with exit 0 when `LLAMA_MOE_TEST_GGUF` is unset. |
+| `test-repack-slices` | MVP closeout | Byte-level original-vs-repacked expert slice verification. Self-skips unless `LLAMA_MOE_TEST_ORIGINAL_GGUF` and `LLAMA_MOE_TEST_GGUF` are set. |
+| `test-moe-oracle-failfast` | MVP closeout | Verifies `--moe-oracle` exits with a post-MVP error. |
 
 ```powershell
 ctest --test-dir build-moe -C Release -L moe-offload --output-on-failure

@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <cstdio>
+#include <fstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace llama_moe {
@@ -24,6 +27,14 @@ const char * predictor_kind_name(predictor_kind kind) {
         case predictor_kind::eamc: return "eamc";
     }
     return "unknown";
+}
+
+bool predictor::load(const std::string &) {
+    return false;
+}
+
+bool predictor::save(const std::string &) const {
+    return false;
 }
 
 class lru_predictor final : public predictor {
@@ -147,6 +158,95 @@ public:
         if (corpus.size() > capacity) {
             evict_redundant();
         }
+    }
+
+    bool load(const std::string & path) override {
+        if (path.empty()) {
+            return false;
+        }
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            return false;
+        }
+
+        char magic[5] = {};
+        uint32_t file_n_layers = 0;
+        uint32_t file_n_experts = 0;
+        uint64_t file_capacity = 0;
+        uint64_t file_top_k = 0;
+        uint64_t rows = 0;
+
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char *>(&file_n_layers), sizeof(file_n_layers));
+        in.read(reinterpret_cast<char *>(&file_n_experts), sizeof(file_n_experts));
+        in.read(reinterpret_cast<char *>(&file_capacity), sizeof(file_capacity));
+        in.read(reinterpret_cast<char *>(&file_top_k), sizeof(file_top_k));
+        in.read(reinterpret_cast<char *>(&rows), sizeof(rows));
+
+        const size_t row_size = (size_t) n_layers * (size_t) n_experts;
+        if (!in || std::string(magic, 4) != "EAM1" ||
+            file_n_layers != (uint32_t) n_layers ||
+            file_n_experts != (uint32_t) n_experts ||
+            file_capacity == 0 ||
+            rows > file_capacity ||
+            row_size == 0) {
+            std::fprintf(stderr, "[moe-eamc] ignoring incompatible sidecar: %s\n", path.c_str());
+            return false;
+        }
+
+        std::vector<std::vector<float>> loaded;
+        loaded.reserve((size_t) rows);
+        for (uint64_t r = 0; r < rows; ++r) {
+            std::vector<float> row(row_size);
+            in.read(reinterpret_cast<char *>(row.data()), (std::streamsize) (row.size() * sizeof(float)));
+            if (!in) {
+                std::fprintf(stderr, "[moe-eamc] ignoring truncated sidecar: %s\n", path.c_str());
+                return false;
+            }
+            loaded.push_back(std::move(row));
+        }
+
+        corpus = std::move(loaded);
+        capacity = (size_t) file_capacity;
+        top_k = (size_t) file_top_k;
+        std::fprintf(stderr, "[moe-eamc] loaded %zu EAMC row(s) from %s\n", corpus.size(), path.c_str());
+        return true;
+    }
+
+    bool save(const std::string & path) const override {
+        if (path.empty() || corpus.empty()) {
+            return false;
+        }
+
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            std::fprintf(stderr, "[moe-eamc] failed to open sidecar for write: %s\n", path.c_str());
+            return false;
+        }
+
+        const char magic[4] = {'E', 'A', 'M', '1'};
+        const uint32_t file_n_layers = (uint32_t) n_layers;
+        const uint32_t file_n_experts = (uint32_t) n_experts;
+        const uint64_t file_capacity = (uint64_t) capacity;
+        const uint64_t file_top_k = (uint64_t) top_k;
+        const uint64_t rows = (uint64_t) corpus.size();
+
+        out.write(magic, sizeof(magic));
+        out.write(reinterpret_cast<const char *>(&file_n_layers), sizeof(file_n_layers));
+        out.write(reinterpret_cast<const char *>(&file_n_experts), sizeof(file_n_experts));
+        out.write(reinterpret_cast<const char *>(&file_capacity), sizeof(file_capacity));
+        out.write(reinterpret_cast<const char *>(&file_top_k), sizeof(file_top_k));
+        out.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+        for (const auto & row : corpus) {
+            out.write(reinterpret_cast<const char *>(row.data()), (std::streamsize) (row.size() * sizeof(float)));
+        }
+
+        if (!out) {
+            std::fprintf(stderr, "[moe-eamc] failed while writing sidecar: %s\n", path.c_str());
+            return false;
+        }
+        return true;
     }
 
 private:

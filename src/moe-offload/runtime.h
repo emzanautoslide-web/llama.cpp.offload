@@ -17,6 +17,7 @@ struct runtime_options {
     uint64_t cache_vram_mb = 0;
     float cache_vram_frac = 0.0f;
     std::string predictor = "lru";
+    std::string eamc_path;
     std::string profile_csv;
     std::string profile_summary;
     bool oracle = false;

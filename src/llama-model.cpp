@@ -2162,6 +2162,7 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
     #ifdef LLAMA_MOE_OFFLOAD
         /*.moe_predictor               =*/ "lru",
+        /*.moe_eamc_path               =*/ nullptr,
         /*.moe_profile_csv             =*/ nullptr,
         /*.moe_profile_summary         =*/ nullptr,
         /*.moe_cache_vram_mb           =*/ 0,

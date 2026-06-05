@@ -15,6 +15,15 @@ namespace llama_moe {
 
 namespace {
 
+std::string default_eamc_path(const std::string & model_path) {
+    const size_t slash = model_path.find_last_of("/\\");
+    const size_t dot = model_path.find_last_of('.');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
+        return model_path.substr(0, dot) + ".eamc";
+    }
+    return model_path + ".eamc";
+}
+
 bool read_u32(const gguf_context * ctx, const char * key, uint32_t & value) {
     const int64_t kid = gguf_find_key(ctx, key);
     if (kid < 0) {
@@ -134,6 +143,11 @@ bool configure_from_params(
         const llama_model_loader & ml) {
     manifest mf = inspect_manifest(ml.metadata, model_path);
 
+    if (params.moe_oracle) {
+        LLAMA_LOG_ERROR("%s: --moe-oracle is deferred to post-MVP and is not implemented in this build\n", __func__);
+        return false;
+    }
+
     if (!params.moe_offload) {
         if (mf.present) {
             LLAMA_LOG_INFO("%s: MoE offload metadata detected; runtime flag is disabled\n", __func__);
@@ -154,6 +168,10 @@ bool configure_from_params(
     opts.cache_vram_mb = params.moe_cache_vram_mb;
     opts.cache_vram_frac = params.moe_cache_vram_frac;
     opts.predictor = params.moe_predictor ? params.moe_predictor : "lru";
+    opts.eamc_path = params.moe_eamc_path ? params.moe_eamc_path : "";
+    if (opts.eamc_path.empty() && opts.predictor == "eamc") {
+        opts.eamc_path = default_eamc_path(model_path);
+    }
     opts.profile_csv = params.moe_profile_csv ? params.moe_profile_csv : "";
     opts.profile_summary = params.moe_profile_summary ? params.moe_profile_summary : "";
     opts.oracle = params.moe_oracle;

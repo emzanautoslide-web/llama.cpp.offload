@@ -338,4 +338,20 @@ if (LLAMA_MOE_OFFLOAD)
     # exit 0 when LLAMA_MOE_TEST_GGUF is unset.
     llama_build_and_test(moe-offload/test-manifest-roundtrip.cpp
         LABEL "moe-offload")
+
+    # Byte-slice verifier compares the original GGUF against the repacked
+    # GGUF when LLAMA_MOE_TEST_ORIGINAL_GGUF and LLAMA_MOE_TEST_GGUF are set.
+    llama_build_and_test(moe-offload/test-repack-slices.cpp
+        LABEL "moe-offload")
+
+    if (LLAMA_BUILD_TOOLS)
+        add_test(
+            NAME test-moe-oracle-failfast
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${CMAKE_COMMAND}
+                -DORACLE_EXE=$<TARGET_FILE:llama-completion>
+                -DORACLE_MODEL=${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf
+                -P ${PROJECT_SOURCE_DIR}/cmake/moe-oracle-failfast.cmake)
+        set_property(TEST test-moe-oracle-failfast PROPERTY LABELS "moe-offload")
+    endif()
 endif()
