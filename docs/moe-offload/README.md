@@ -12,7 +12,7 @@ cmake --build build-moe --config Release --target llama-moe-bench llama-completi
 ## Repack
 
 ```powershell
-.\build-moe\bin\llama-moe-repack.exe `
+.\build-moe\bin\Release\llama-moe-repack.exe `
   --input C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.gguf `
   --output C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
   --manifest C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf.json
