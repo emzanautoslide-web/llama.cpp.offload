@@ -121,29 +121,15 @@ ggml_tensor * remap_selected_experts(
     }
     (void) n_expert;
 
-    // Strategy (D-4): use the per-layer persistent slot_table tensor that was
-    // pre-allocated by `intercept_expert_tensor` at model-load time. Because
-    // it lives in the same backend buffer as the slot weight tensors (NOT a
-    // scheduler-managed temporary), its storage is never recycled, so the
-    // eval-callback's mid-graph `ggml_backend_tensor_set` is read correctly
-    // by this `ggml_get_rows`.
-    ggml_tensor * slot_table = get_slot_table_tensor(layer);
-    static int remap_cnt = 0;
-    if (remap_cnt < 4) {
-        fprintf(stderr, "[moe-d4] remap_selected_experts #%d L=%d slot_table=%p has_buf=%d\n",
-                remap_cnt, layer, (void*)slot_table,
-                slot_table && slot_table->buffer ? 1 : 0);
-    }
-    ++remap_cnt;
-    if (!slot_table) {
+    if (!streaming_mode()) {
         return selected_experts;
     }
 
-    register_slot_table_for_topk(layer, selected_experts, slot_table);
-
-    ggml_tensor * sel_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, selected_experts), neu * nt);
-    ggml_tensor * mapped   = ggml_get_rows(ctx, slot_table, sel_flat);
-    return ggml_reshape_2d(ctx, mapped, neu, nt);
+    ggml_tensor * slot_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, neu, nt);
+    ggml_format_name(slot_ids, "moe.slot_ids.%d", layer);
+    ggml_set_output(slot_ids);
+    register_slot_ids_for_topk(layer, selected_experts, slot_ids);
+    return slot_ids;
 }
 
 } // namespace llama_moe

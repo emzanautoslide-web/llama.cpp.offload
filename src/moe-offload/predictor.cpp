@@ -97,10 +97,12 @@ public:
     void begin_request() override {
         std::fill(current.begin(), current.end(), 0.0f);
         current_layer = -1;
+        invalidate_score_cache();
     }
 
     void observe(int layer, const std::vector<int> & experts_used) override {
         ++step;
+        invalidate_score_cache();
         if (layer < 0 || layer >= n_layers) {
             return;
         }
@@ -121,14 +123,8 @@ public:
             return (float) last_use[index(layer, expert)];
         }
 
-        std::vector<std::pair<float, size_t>> ranked;
-        ranked.reserve(corpus.size());
-        for (size_t i = 0; i < corpus.size(); ++i) {
-            ranked.push_back({cosine_partial(corpus[i]), i});
-        }
-        const size_t k = std::min(top_k, ranked.size());
-        std::partial_sort(ranked.begin(), ranked.begin() + (ptrdiff_t) k, ranked.end(),
-            [](const auto & a, const auto & b) { return a.first > b.first; });
+        const auto & ranked = nearest_neighbors();
+        const size_t k = ranked.size();
 
         double weighted = 0.0;
         double weights = 0.0;
@@ -158,6 +154,7 @@ public:
         if (corpus.size() > capacity) {
             evict_redundant();
         }
+        invalidate_score_cache();
     }
 
     bool load(const std::string & path) override {
@@ -210,6 +207,7 @@ public:
         corpus = std::move(loaded);
         capacity = (size_t) file_capacity;
         top_k = (size_t) file_top_k;
+        invalidate_score_cache();
         std::fprintf(stderr, "[moe-eamc] loaded %zu EAMC row(s) from %s\n", corpus.size(), path.c_str());
         return true;
     }
@@ -273,6 +271,38 @@ private:
         return (float) (dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
     }
 
+    const std::vector<std::pair<float, size_t>> & nearest_neighbors() const {
+        if (score_cache_valid && score_cache_step == step && score_cache_layer == current_layer) {
+            return score_cache;
+        }
+
+        score_cache.clear();
+        if (corpus.empty() || current_layer < 0 || top_k == 0) {
+            score_cache_valid = true;
+            score_cache_step = step;
+            score_cache_layer = current_layer;
+            return score_cache;
+        }
+
+        std::vector<std::pair<float, size_t>> ranked;
+        ranked.reserve(corpus.size());
+        for (size_t i = 0; i < corpus.size(); ++i) {
+            ranked.push_back({cosine_partial(corpus[i]), i});
+        }
+        const size_t k = std::min(top_k, ranked.size());
+        std::partial_sort(ranked.begin(), ranked.begin() + (ptrdiff_t) k, ranked.end(),
+            [](const auto & a, const auto & b) { return a.first > b.first; });
+        score_cache.assign(ranked.begin(), ranked.begin() + (ptrdiff_t) k);
+        score_cache_valid = true;
+        score_cache_step = step;
+        score_cache_layer = current_layer;
+        return score_cache;
+    }
+
+    void invalidate_score_cache() const {
+        score_cache_valid = false;
+    }
+
     static float cosine_full(const std::vector<float> & a, const std::vector<float> & b) {
         double dot = 0.0;
         double norm_a = 0.0;
@@ -316,6 +346,10 @@ private:
     std::vector<float> current;
     std::vector<uint64_t> last_use;
     std::vector<std::vector<float>> corpus;
+    mutable bool score_cache_valid = false;
+    mutable uint64_t score_cache_step = 0;
+    mutable int score_cache_layer = -1;
+    mutable std::vector<std::pair<float, size_t>> score_cache;
 };
 
 std::unique_ptr<predictor> make_predictor(

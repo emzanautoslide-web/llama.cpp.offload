@@ -1,13 +1,18 @@
 # MoE Offload MVP
 
-This fork adds a guarded MoE offload overlay behind `LLAMA_MOE_OFFLOAD`. The default build path remains off.
+This fork adds a guarded MoE offload overlay behind `LLAMA_MOE_OFFLOAD`. The
+default build path remains off.
 
 ## Build
 
 ```bash
 cmake -B build-moe -DLLAMA_MOE_OFFLOAD=ON -DGGML_CUDA=ON
-cmake --build build-moe --config Release --target llama-moe-bench
+cmake --build build-moe --config Release --target llama-completion llama-moe-bench
 ```
+
+The non-MoE build gate is kept separate. On 2026-06-05,
+`build-vanilla-check` with `LLAMA_MOE_OFFLOAD=OFF` and `GGML_CUDA=OFF` built
+`llama-completion` successfully.
 
 ## Repack
 
@@ -18,7 +23,19 @@ build-moe/bin/llama-moe-repack \
   --manifest C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf.json
 ```
 
-The current repacker writes a stock-loadable GGUF with page-aligned tensor data and `moe_offload.*` metadata. It records the layout as `fused-tensors-page-aligned-v1`: the original fused expert tensors remain in the file, and `moe_offload.expert_blob.table` records each `(logical_layer, expert, kind)` byte range relative to the GGUF data section.
+The repacker writes a stock-loadable GGUF with page-aligned tensor data and
+`moe_offload.*` metadata. The implemented layout is
+`fused-tensors-page-aligned-v1`: the original fused expert tensors remain in
+the file, and `moe_offload.expert_blob.table` records each
+`(logical_layer, expert, kind)` byte range relative to the GGUF data section.
+
+Closeout validation on Qwen3.5-35B-A3B Q4_K_M:
+
+- Manifest/table size/range checks pass.
+- `test-repack-slices` byte-compares every table entry against the exact slice
+  in the original GGUF.
+- Original GGUF vs repacked `.moe.gguf` with offload disabled matched golden
+  logits exactly.
 
 ## Run
 
@@ -31,7 +48,13 @@ The current repacker writes a stock-loadable GGUF with page-aligned tensor data 
   -p "Hello" -n 32
 ```
 
-`--moe-predictor` accepts `lru` or `eamc`. `--moe-eamc-path PATH` selects the EAMC predictor sidecar; when omitted with `--moe-predictor eamc`, the runtime uses the model path with a `.eamc` suffix. `--moe-profile-csv PATH` and `--moe-profile-summary PATH` write profiling data.
+`--moe-predictor` accepts `lru` or `eamc`. `--moe-eamc-path PATH` selects the
+EAMC predictor sidecar. When omitted with `--moe-predictor eamc`, the runtime
+uses the model path with a `.eamc` suffix. `--moe-profile-csv PATH` and
+`--moe-profile-summary PATH` write profiling data.
+
+`--moe-oracle` is not part of the MVP. The parser field exists, but passing the
+flag fails fast with a clear post-MVP error.
 
 ## Bench
 
@@ -40,51 +63,34 @@ The current repacker writes a stock-loadable GGUF with page-aligned tensor data 
   --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
   --pp 1024 --tg 256 --repeat 3 `
   --moe-cache-vram-mb 8000 --moe-predictor eamc `
-  --moe-eamc-path C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.eamc `
-  --moe-profile-csv moe-profile.csv `
-  --moe-profile-summary moe-summary.txt
+  --moe-eamc-path tests/moe-offload/_out/moe-bench-1024x256.eamc `
+  --moe-profile-csv tests/moe-offload/_out/moe-bench-1024x256.csv `
+  --moe-profile-summary tests/moe-offload/_out/moe-bench-1024x256.summary.txt `
+  -ngl 99 -c 4096
 ```
 
-The bench tool enables MoE offload automatically, runs prefill + decode loops,
-and always prints the summary report to stdout. If `--moe-profile-summary` is
-set, `llama-moe-bench` writes the same §4.7 report to that path after all
-repeats complete. During long runs, it also checkpoints the same summary file
-after prefill and after each completed repeat, so the file appears before the
-full benchmark finishes. It intentionally does not use the runtime
-`end_request()` summary writer, which emits the older aggregate-only format. If
-`--moe-profile-csv` is set, a per-layer profile CSV is written to that path.
+The bench tool enables MoE offload automatically, runs prefill and decode loops,
+prints the summary to stdout, and writes CSV/summary files when requested.
 
-Example summary:
-```
-model: Qwen3.5-35B-A3B Q4_K_M
-predictor: eamc      cache: 8000 MB   ssd: C:
-n_prompt: 1024  n_gen: 256  repeats: 3
+Observed dev-box closeout result on 2026-06-05:
 
-phase     tokens   total_ms   per_token_ms   tok/s
-prefill     1024     1320.4          1.29     774
-decode       256     9874.2         38.57      26
+- Exit code: 0.
+- Repeats: 3.
+- TTFT: 68463.7 ms.
+- TPOT: 115.54 ms.
+- Total: 98041.7 ms.
+- Prefill hit rate: 77.8%.
+- Decode hit rate: 90.2%.
+- Decode SSD reads: 42.63 GB, average 56.85 MB/token.
+- Predictor overhead: 40.63 ms/token.
+- VRAM peak: 10.15 GB / 15.92 GB.
+- DRAM peak: 1.56 GB.
+- Profile rows: prefill=15360, decode=30720.
 
-cache hit rate (prefill): 0.0%
-cache hit rate (decode): 78.3%
-SSD bytes read (decode): 3.42 GB  (avg 13.4 MB/token)
-TTFT: 1320.4 ms
-TPOT: 38.57 ms
-total: 11194.6 ms
+There is no MVP performance floor. This number is a stability and measurement
+gate, not a throughput target.
 
-I/O breakdown (decode, mean per token):
-  ssd_read          21.50 ms
-  h2d                7.80 ms
-  gpu_compute        0.00 ms
-  stall (overlap loss)     29.30 ms
-  predictor          0.04 ms
-
-VRAM peak: 14.80 GB / 15.92 GB  (experts budget: 7.81 GB, other model/kv/compute: 6.99 GB)
-DRAM peak (process): 1.40 GB
-SSD reads: 18234 (avg 0.19 MB each, avg latency 1.18 ms)
-profile rows: prefill=40 decode=10240
-```
-
-CSV columns:
+## Profile CSV
 
 | Column | Meaning |
 | --- | --- |
@@ -94,158 +100,136 @@ CSV columns:
 | `k_required` | Distinct experts required by the router for this layer/callback. |
 | `k_hit` | Required experts already resident in the slot cache. |
 | `k_miss` | Required experts loaded from the repacked GGUF. |
-| `ssd_read_us` | Wall microseconds spent in `fread` for misses (worker-thread-measured). |
-| `h2d_us` | Microseconds spent in host→device copy. On the CUDA async path this is the sum of `cudaEventElapsedTime` between the per-blob begin/end events recorded on the dedicated MoE H2D stream; on the sync fallback it is host-measured around `ggml_backend_tensor_set`. Mixed contribution per row when both paths fire. |
-| `compute_us` | CUDA-event-timed compute interval for the layer, derived from begin/end events recorded on the compute stream and queried at `slot_pool_end_request()`. Each row's interval brackets the slot_table write of layer L through the topk callback of layer L+1 (or `end_request` for the final layer); this is an over-approximation that includes layer L's MoE compute plus the following attention block. |
-| `stall_us` | Host wall-clock around miss completion and compute-stream wait insertion for miss events. This is still an approximation of overlap loss, not a pure CUDA event duration. |
+| `ssd_read_us` | Worker-thread wall microseconds spent reading missed expert blobs from the GGUF. |
+| `h2d_us` | Host-to-device copy time. On the CUDA async path this is event-based timing on the dedicated MoE H2D stream; on the sync fallback it is host-measured around `ggml_backend_tensor_set`. |
+| `compute_us` | CUDA-event-timed compute interval for the layer. The interval still over-approximates pure MoE compute because it brackets from the previous slot update to the next MoE top-k callback. |
+| `stall_us` | Host wall time spent waiting for miss completion and inserting compute-stream waits. This is an approximation of overlap loss, not a pure CUDA event duration. |
 | `pred_us` | Host microseconds spent in predictor `observe()` plus eviction `score()` calls for this row. |
 | `cache_resident_experts` | Number of experts resident for the layer after miss handling. |
 | `predictor` | `lru` or `eamc`. |
 
 ## Current State
 
-Implemented in this slice:
+Implemented in the MVP slice:
 
 - `LLAMA_MOE_OFFLOAD` build option.
-- Guarded CLI/model parameters: `--moe-offload`, cache budget knobs, predictor choice, EAMC sidecar path, profile paths, and oracle fail-fast.
+- Guarded CLI/model parameters: `--moe-offload`, cache budget knobs, predictor
+  choice, EAMC sidecar path, profile paths, and oracle fail-fast.
 - Loader metadata validation for `moe_offload.version`.
-- LRU and EAMC predictor implementations, including binary EAMC sidecar save/load.
-- Slot-cache model and profiling CSV/summary plumbing, including `pred_us` predictor overhead.
-- Guarded hooks at model load, decode request boundaries, and MoE top-k graph construction.
 - `llama-moe-repack` and `llama-moe-bench` targets.
-- **D-4**: Pre-allocated slot_table tensors via `create_unfiled_tensor`; zero-init of all slot tensors; ubatch auto-cap to 8 in streaming mode.
-- **D-5**: Threaded I/O worker (`src/moe-offload/io.{h,cpp}`).
-- **E**: Per-layer CSV profiling rows; snapshot summary; LRU/EAMC predictor wired into eval-callback eviction.
-- **F**: `llama-moe-bench` emits the §4.7-style stdout/file summary and writes nonempty CSV rows when requested.
-- **G**: CUDA stream accessor (`moe_io_cuda_*` in `ggml/src/ggml-cuda/moe_offload_io.cu`), pinned-host staging, dedicated MoE H2D stream, event pool.
-- **H**: Eval-callback rewired to async H2D via `io_h2d_async_timed` + `io_compute_wait` (`cudaStreamWaitEvent` on the compute stream). Synchronous double-read of the miss blob removed.
-- **I**: Real `compute_us` via CUDA events. Profile rows are buffered per `llama_decode` batch and flushed at `slot_pool_end_request()` after `cudaEventElapsedTime` queries. Per-miss `h2d_us` now comes from event timing on the async path.
-- **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
-- **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
-- **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. CUDA `MUL_MAT_ID` on `.slot` tensors bypasses the specialized MMVQ/MMQ/MMF paths and uses the generic sorted path for correctness-first validation.
-- **L**: IO worker shutdown wired into `llama_context::~llama_context()`; small-cache (≤8000 MiB) and multi-token-prompt streaming deadlocks fixed by enlarging the IO buffer pool to cover worst-case in-flight misses and by excluding just-reserved experts from LRU/predictor eviction within the same callback.
+- Repacker byte-slice verifier for original-vs-repacked expert ranges.
+- LRU and EAMC predictor implementations, including binary EAMC sidecar
+  save/load with shape/version checks.
+- EAMC nearest-neighbor score caching so repeated eviction scoring in the same
+  callback does not recompute the full ranking for each candidate.
+- Slot-cache model and profiling CSV/summary plumbing, including `pred_us`.
+- Guarded hooks at model load, decode request boundaries, and MoE top-k graph
+  construction.
+- Async SSD-to-VRAM expert loading with pinned staging buffers, a dedicated
+  MoE H2D stream, event pool, and compute-stream waits for misses.
+- Event-based `h2d_us` and `compute_us`.
+- Streaming slot tensors default to the actual cache slot count.
+- Streaming remap uses callback-filled `moe.slot_ids.<layer>` tensors consumed
+  directly by `MUL_MAT_ID`, avoiding same-forward-pass slot-table corruption.
+- CUDA `.slot` `MUL_MAT_ID` bypasses the specialized MMVQ/MMQ/MMF paths and
+  uses the generic sorted path for correctness-first validation.
+- CUDA top-k MoE fusion is disabled in `LLAMA_MOE_OFFLOAD` builds because it was
+  isolated as the source of the full-vs-streaming golden-logit mismatch.
+- Fingerprint diagnostics are debug-only via `LLAMA_MOE_DEBUG_SLOT_FP`.
+- Streaming `n_ubatch` is still capped to 8.
 
 ## Correctness
 
-Streaming numerical correctness is gated by a per-decode logit dump and a
-full-residency vs. streaming comparison. The harness lives at
-`tests/moe-offload/test-golden-logits.ps1` and is *not* registered with
-CTest (the reference model is multi-GB).
-
-How to run:
+Golden-logit validation is done with `llama-completion --logit-dump` and
+`tests/moe-offload/compare_logits.py`. The PowerShell harness runs a
+full-residency reference and a forced-eviction streaming run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\moe-offload\test-golden-logits.ps1 `
-    -Tol 1e-3 -NPredict 8 -StreamCacheMb 12000
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-golden-logits.ps1 `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000 `
+  -Prompt "Hello" -Seed 42 -Context 4096 -UBatch 8
 ```
 
-The harness runs `llama-completion --logit-dump` twice on the same model
-and seed: once at `--moe-cache-vram-mb 99999` (full residency, reference)
-and once at `--moe-cache-vram-mb 12000` (streaming, n_slots=145 vs.
-n_experts=256 — forces eviction every layer). `tests/moe-offload/compare_logits.py`
-then mmaps both binary dumps and reports `max|Δlogit|` / `mean|Δlogit|`.
-Exit 0 iff `max|Δlogit| < --tol`.
-
-Observed on the dev box (2026-05-28, Qwen3.5-35B-A3B-Q4_K_M, prompt
-`"Hello"`, `--temp 0 --seed 42 -n 8`, 12000 MiB streaming cache,
-n_slots=145, hits=630 misses=970):
+Observed dev-box closeout result on 2026-06-05:
 
 | Metric | Value |
-|---|---|
+| --- | --- |
 | `n_steps` | 8 |
 | `n_vocab` | 248320 |
-| `max|Δlogit|` | **4.64e-01** |
-| `mean|Δlogit|` | 3.67e-02 |
-| `tol` | 1e-3 |
-| Result | **FAIL** (drift first observed at step 3) |
+| `max|d|` | 0 |
+| `mean|d|` | 0 |
+| Result | PASS |
 
-The drift is real — the gate is doing its job. Streaming-mode top-1 tokens
-still match full-residency for the first 8 decodes at temp=0 (per Phase H/I
-text-equivalence smoke), but the full softmax row is not bit-equivalent.
-Root cause is not yet pinned down; Phase J anticipated a stale
-`topk → slot_table` registration on a rebuild path
-(`reset_graph_state()` now also fires in `llama_context::graph_reserve()`),
-but that alone did not move the measured drift. Remaining hypotheses:
+Additional deterministic correctness checks:
 
-- A slot whose contents are replaced between the eval callback finishing
-  H2D and the mul_mat_id consuming the row (eviction/wait ordering bug
-  in `slot_pool::moe_eval_callback`).
-- An expert whose slot_table entry is set by a later layer's callback
-  before the current layer's mul_mat_id runs (callback ordering vs.
-  scheduler topology).
+- Full-residency offload matched repacked/offload-disabled golden logits.
+- Streaming offload at `--moe-cache-vram-mb 4000` matched full residency.
+- LRU and EAMC produced identical logit dumps at `--temp 0 --seed 42`.
 
-The June 5 closeout changes address the two leading runtime suspects from this
-section: slot tensors now use the actual cache slot count by default, and CUDA
-`MUL_MAT_ID` on `.slot` tensors bypasses the specialized MMVQ/MMQ/MMF paths.
-The historical drift number above remains in the document until the dev-box
-golden-logit harness is rerun against the new build.
+The earlier Phase J drift (`max|d| = 4.64e-01`) is closed. The root cause was
+not the repacker. It was isolated to runtime CUDA graph behavior: the
+correctness gate passed when CUDA fusion was disabled, and disabling top-k MoE
+fusion under `LLAMA_MOE_OFFLOAD` was sufficient to keep the gate passing.
 
-Deviations from the source plan (`implementation_plan_mvp_20260529.md` §3):
-
-- `--moe-cache-vram-mb 4000` previously deadlocked during prefill on this
-  dev box; Phase L raised the IO worker's pinned-buffer pool floor so the
-  miss-loop can submit a layer's worst-case unique-expert demand without
-  starving on staging buffers. Re-tested at cache=4000 with `-n 4 -p
-  "Hello"`: runs to completion. The harness still defaults to 12000 MiB
-  because the dev-box reference run was captured at that size; lower
-  caches can now be used safely.
-- The plan called for prompt `"The quick brown fox"`. Multi-token-prompt
-  streaming hangs (same buffer-pool starvation) are also fixed by the
-  Phase L bump. Re-tested with prompt `"The quick brown fox"` at
-  cache=12000, `-n 4`: prefill + decode complete cleanly.
-- Phase J's measured drift number (`max|Δlogit|=4.64e-01`) was captured
-  on the build that produced the first `"Hello, I am a 20 year"` smoke.
-  Subsequent regressions on the same HEAD have made full-residency
-  itself crash with `GGML_ASSERT(buf != NULL && "tensor buffer not set")`
-  inside `prefetch_all_experts`; this regression is pre-existing
-  relative to Phase L (confirmed by `git stash` baseline) and prevents
-  the harness from regenerating the reference dump. Root-causing this
-  regression is on the post-MVP list; the Phase J drift number stays in
-  the table above as the last good measurement.
-
-## Test surface
+## Test Surface
 
 CTest targets under label `moe-offload`:
 
-| Test | Phase | Purpose |
-|---|---|---|
-| `test-cuda-stream` | G | Pinned alloc + async H2D + event ordering smoke. |
-| `test-eamc-cosine` | K | EAMC cosine ordering, sidecar round-trip, and redundancy replacement on full insert. |
-| `test-lru-eviction` | K | Hand-computed LRU score values, victim ordering, per-layer isolation. |
-| `test-manifest-roundtrip` | K | GGUF manifest sanity (version=2, table size, per-record file ranges). Self-skips with exit 0 when `LLAMA_MOE_TEST_GGUF` is unset. |
-| `test-repack-slices` | MVP closeout | Byte-level original-vs-repacked expert slice verification. Self-skips unless `LLAMA_MOE_TEST_ORIGINAL_GGUF` and `LLAMA_MOE_TEST_GGUF` are set. |
-| `test-moe-oracle-failfast` | MVP closeout | Verifies `--moe-oracle` exits with a post-MVP error. |
+| Test | Purpose |
+| --- | --- |
+| `test-cuda-stream` | Pinned alloc, async H2D, and event ordering smoke. |
+| `test-eamc-cosine` | EAMC cosine ordering, sidecar round-trip, and redundancy replacement on full insert. |
+| `test-lru-eviction` | Hand-computed LRU score values, victim ordering, and per-layer isolation. |
+| `test-manifest-roundtrip` | GGUF manifest sanity: version, table size, and per-record file ranges. Self-skips when `LLAMA_MOE_TEST_GGUF` is unset. |
+| `test-repack-slices` | Byte-level original-vs-repacked expert slice verification. Self-skips unless `LLAMA_MOE_TEST_ORIGINAL_GGUF` and `LLAMA_MOE_TEST_GGUF` are set. |
+| `test-moe-oracle-failfast` | Verifies `--moe-oracle` exits with a post-MVP error. |
 
 ```powershell
 ctest --test-dir build-moe -C Release -L moe-offload --output-on-failure
 ```
 
-Dev-box-only PowerShell harnesses under `tests/moe-offload/` (not
-registered with CTest because they need the multi-GB model):
+Closeout result: 6/6 tests passed.
 
-- `test-golden-logits.ps1` — Phase J streaming-vs-full-residency logit
-  comparison gate.
-- `compare_logits.py` — binary-dump comparator used by the harness.
+Dev-box-only harnesses under `tests/moe-offload/` are not registered with CTest
+because they need the multi-GB model:
 
-See [`tests/moe-offload/README.md`](../../tests/moe-offload/README.md)
-for runtime prereqs and invocation details.
+- `test-golden-logits.ps1`: streaming-vs-full-residency logit gate.
+- `compare_logits.py`: binary-dump comparator used by the harness.
+
+See [`tests/moe-offload/README.md`](../../tests/moe-offload/README.md) for
+runtime prerequisites and invocation details.
+
+## Limitations
+
+- Streaming mode caps `n_ubatch` to 8 when `n_slots < n_experts`.
+- CUDA top-k MoE fusion remains disabled in `LLAMA_MOE_OFFLOAD` builds.
+- CUDA `.slot` `MUL_MAT_ID` uses a correctness-first generic path instead of
+  the specialized MMVQ/MMQ/MMF path.
+- `stall_us` is still an approximation of overlap loss.
+- Direct I/O, multi-GPU, CPU DRAM expert tier, KV offload, learned predictors,
+  speculative prefetch/decoding, FineMoE-style splitting, and ubatch-cap
+  removal are post-MVP.
 
 ## Troubleshooting
 
-### "n_uniq exceeds n_slots" error
-```
+### `n_uniq exceeds n_slots`
+
+```text
 moe_eval_callback: n_uniq=96 exceeds n_slots=48
 ```
-Increase `--moe-cache-vram-mb` so `n_slots >= worst-case unique experts per batch`,
-or reduce batch size with `-ub`.
+
+All unique experts selected in one callback must fit in the per-layer cache at
+the same time. Increase `--moe-cache-vram-mb` so
+`n_slots >= worst-case unique experts per batch`, or reduce batch size.
 
 ### Streaming mode caps ubatch to 8
-When `--moe-cache-vram-mb` is small enough that `n_slots < n_expert` (streaming mode),
-the ubatch is automatically capped to **8** to avoid a known `ggml_get_rows`→`mm_ids_helper`
-kernel crash. This reduces prefill throughput (~2-5× slowdown). To restore full throughput,
-use full residency: `--moe-cache-vram-mb 99999`.
 
-### CUDA illegal memory access at launch_mul_mat_q
-This is the ubatch-capping issue above. Ensure you are using the latest build
-which auto-caps ubatch to 8 in streaming mode. If you need larger ubatch,
-use full residency or investigate `ggml/src/ggml-cuda/mmq.cu` + `mmid.cu`.
+When `--moe-cache-vram-mb` is small enough that `n_slots < n_experts`,
+`n_ubatch` is automatically capped to 8. This avoids the known large-ubatch
+streaming crash but reduces prefill throughput. Use full residency with a large
+cache budget if you need uncapped ubatch behavior.
+
+### `--moe-oracle` fails
+
+This is expected. Oracle mode is deferred to post-MVP and fails fast by design.

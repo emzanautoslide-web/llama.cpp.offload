@@ -50,12 +50,11 @@ struct slot_pool_state {
     // eval-callback's mid-graph `ggml_backend_tensor_set` is read correctly
     // by the immediately-following `ggml_get_rows` consumer.
     std::vector<ggml_tensor *> slot_table_tensors;
-    // Phase D-1/D-2: per-(topk tensor) slot_table input tensor. Because the
-    // compute graph can be rebuilt multiple times (graph_reserve passes,
-    // different ubatch shapes) we record the (topk -> slot_table) association
-    // per graph build so the eval-callback always writes to the slot_table
-    // tensor of the SAME graph being executed.
+    // Per-graph top-k registries. Streaming mode uses topk_to_slot_ids so the
+    // callback can fill the exact ids consumed by MUL_MAT_ID. The older
+    // slot-table path is kept for guarded fallback diagnostics.
     std::unordered_map<ggml_tensor *, ggml_tensor *> topk_to_slot_table;
+    std::unordered_map<ggml_tensor *, ggml_tensor *> topk_to_slot_ids;
     std::unordered_map<ggml_tensor *, int> topk_to_logical;
     // Flat list of all registered slot_table tensors across graph builds.
     // Used by populate_slot_tables_identity (non-streaming mode) which writes
@@ -68,9 +67,8 @@ struct slot_pool_state {
         std::unordered_map<int32_t, int32_t> exp2slot;
         std::list<int32_t> lru;                       // front = most-recent expert
         std::unordered_map<int32_t, std::list<int32_t>::iterator> lru_it;
-        // Phase M.7: FNV1a-64 hash of the first 1024 bytes of each cached
-        // expert's slot data (gate kind).  Used to detect cross-step GPU
-        // buffer corruption so we can force a reload.
+        // Optional debug fingerprint of the first 1024 bytes of each cached
+        // expert's slot data (gate kind).
         std::unordered_map<int32_t, uint64_t> fingerprints;
     };
     std::vector<layer_cache> cache;
@@ -147,6 +145,11 @@ llm_tensor base_tensor_of(llm_tensor t) {
     return t;
 }
 
+bool debug_slot_fingerprint() {
+    static const bool enabled = std::getenv("LLAMA_MOE_DEBUG_SLOT_FP") != nullptr;
+    return enabled;
+}
+
 } // namespace
 
 void configure_slot_pool() {
@@ -169,6 +172,7 @@ void configure_slot_pool() {
     s.slot_tensors.assign(mf.n_layers, std::array<ggml_tensor *, EXPERT_KIND_COUNT>{nullptr, nullptr, nullptr});
     s.slot_table_tensors.assign(mf.n_layers, nullptr);
     s.topk_to_slot_table.clear();
+    s.topk_to_slot_ids.clear();
     s.topk_to_logical.clear();
     s.all_slot_tables.clear();
     s.cache.assign(mf.n_layers, slot_pool_state::layer_cache{});
@@ -211,6 +215,7 @@ void reset_slot_pool() {
     s.slot_tensors.clear();
     s.slot_table_tensors.clear();
     s.topk_to_slot_table.clear();
+    s.topk_to_slot_ids.clear();
     s.topk_to_logical.clear();
     s.all_slot_tables.clear();
     s.cache.clear();
@@ -554,10 +559,32 @@ void register_slot_table_for_topk(int logical_layer, ggml_tensor * topk, ggml_te
     ++reg_cnt;
 }
 
+void register_slot_ids_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * slot_ids) {
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.configured || !topk || !slot_ids) {
+        if (std::getenv("LLAMA_MOE_DEBUG_SLOT_IDS")) {
+            fprintf(stderr, "[moe-d4] register_slot_ids_for_topk SKIP: cfg=%d topk=%p ids=%p L=%d\n",
+                    s.configured ? 1 : 0, (void*) topk, (void*) slot_ids, logical_layer);
+        }
+        return;
+    }
+    s.topk_to_slot_ids[topk] = slot_ids;
+    s.topk_to_logical[topk]  = logical_layer;
+    static int reg_cnt = 0;
+    if (std::getenv("LLAMA_MOE_DEBUG_SLOT_IDS") && reg_cnt < 4) {
+        fprintf(stderr, "[moe-d4] register_slot_ids_for_topk #%d L=%d topk=%p ids=%p ids->buf=%s\n",
+                reg_cnt, logical_layer, (void*) topk, (void*) slot_ids,
+                slot_ids->buffer ? ggml_backend_buffer_name(slot_ids->buffer) : "NULL");
+    }
+    ++reg_cnt;
+}
+
 void reset_graph_state() {
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     s.topk_to_slot_table.clear();
+    s.topk_to_slot_ids.clear();
     s.topk_to_logical.clear();
     s.all_slot_tables.clear();
 }
@@ -623,6 +650,15 @@ static int64_t elapsed_us(std::chrono::steady_clock::time_point start,
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+void set_tensor_for_compute(slot_pool_state & s, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (s.compute_backend && tensor && tensor->buffer &&
+            ggml_backend_supports_buft(s.compute_backend, ggml_backend_buffer_get_type(tensor->buffer))) {
+        ggml_backend_tensor_set_async(s.compute_backend, tensor, data, offset, size);
+    } else {
+        ggml_backend_tensor_set(tensor, data, offset, size);
+    }
+}
+
 // Load one expert's three blobs (gate, up, down) from disk into the chosen
 // slot index. Caller holds s.mutex.
 bool load_expert_into_slot(slot_pool_state & s, const manifest & mf,
@@ -682,7 +718,7 @@ bool load_expert_into_slot(slot_pool_state & s, const manifest & mf,
             fflush(stderr);
         }
         const auto h2d_start = std::chrono::steady_clock::now();
-        ggml_backend_tensor_set(slot_tensor, s.io_scratch.data(), write_off, rec.size);
+        set_tensor_for_compute(s, slot_tensor, s.io_scratch.data(), write_off, rec.size);
         const auto h2d_end = std::chrono::steady_clock::now();
         if (stats) {
             stats->h2d_us += elapsed_us(h2d_start, h2d_end);
@@ -721,20 +757,28 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     auto & s = state();
 
     if (ask) {
-        // Phase I: when the *next* MoE layer's topk is about to be computed,
-        // close the previous layer's compute interval by recording
-        // compute_end on the compute stream. We take the lock only when
-        // there is plausibly something to do (cheap atomic-like check on
-        // the previously-set index).
-        if (s.last_pending_idx < 0) {
-            return true;
-        }
         std::lock_guard<std::mutex> lock(s.mutex);
-        if (!s.configured || !s.compute_backend) return true;
-        if (s.last_pending_idx < 0 ||
-            (size_t) s.last_pending_idx >= s.pending_rows.size()) return true;
-        auto stt_it = s.topk_to_slot_table.find(t);
-        if (stt_it == s.topk_to_slot_table.end()) return true;
+        return s.configured && s.topk_to_logical.find(t) != s.topk_to_logical.end();
+    }
+
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.configured) return true;
+
+    // Fast lookup: only react to topk tensors we previously registered.
+    auto stt_it = s.topk_to_slot_table.find(t);
+    ggml_tensor * stt = stt_it == s.topk_to_slot_table.end() ? nullptr : stt_it->second;
+    auto slot_ids_it = s.topk_to_slot_ids.find(t);
+    ggml_tensor * slot_ids_tensor = slot_ids_it == s.topk_to_slot_ids.end() ? nullptr : slot_ids_it->second;
+    auto log_it = s.topk_to_logical.find(t);
+    if (log_it == s.topk_to_logical.end()) return true;
+    const int logical = log_it->second;
+
+    // Phase I: the scheduler has just computed and synchronized the graph
+    // segment ending at this top-k node. Close the previous MoE layer's
+    // compute interval here, before we start staging the current layer's
+    // experts.
+    if (s.compute_backend && s.last_pending_idx >= 0 &&
+        (size_t) s.last_pending_idx < s.pending_rows.size()) {
         auto & p = s.pending_rows[s.last_pending_idx];
         if (!p.compute_end_event) {
             void * ev = io_event_acquire();
@@ -744,19 +788,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 io_event_release(ev);
             }
         }
-        return true;
     }
-
-    std::lock_guard<std::mutex> lock(s.mutex);
-    if (!s.configured) return true;
-
-    // Fast lookup: only react to topk tensors we previously registered.
-    auto stt_it = s.topk_to_slot_table.find(t);
-    if (stt_it == s.topk_to_slot_table.end()) return true;
-    ggml_tensor * stt = stt_it->second;
-    auto log_it = s.topk_to_logical.find(t);
-    if (log_it == s.topk_to_logical.end()) return true;
-    const int logical = log_it->second;
 
     const manifest & mf = get_manifest();
     if (logical < 0 || (size_t) logical >= s.cache.size()) return true;
@@ -865,14 +897,9 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
-    // Phase M.7: verify HIT expert slot data integrity.  The GPU buffer that
-    // backs slot tensors can be aliased by scheduler temporaries or mmq
-    // kernel scratch writes during graph execution.  We read back and hash
-    // the first 1 KiB of each HIT expert's gate-kind slot data and compare
-    // against the fingerprint stored after the last successful load.  A
-    // mismatch means the slot was corrupted; we evict the stale entry so
-    // the miss-loop below reloads it from SSD.
-    {
+    // Debug-only slot integrity detector. This does not repair cache state;
+    // production correctness must come from stable slot storage and remapping.
+    if (debug_slot_fingerprint()) {
         ggml_tensor * fp_tensor = s.slot_tensors[logical][EXPERT_GATE];
         if (fp_tensor && fp_tensor->buffer) {
             const size_t stride   = (size_t) fp_tensor->nb[2];
@@ -899,16 +926,8 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             if (!corrupted.empty()) {
                 static int fp_corrupt_log = 0;
                 for (int32_t e : corrupted) {
-                    auto it = lc.exp2slot.find(e);
-                    if (it != lc.exp2slot.end()) {
-                        lc.slot_to_expert[it->second] = -1;
-                        auto lru_it = lc.lru_it.find(e);
-                        if (lru_it != lc.lru_it.end()) { lc.lru.erase(lru_it->second); lc.lru_it.erase(lru_it); }
-                        lc.exp2slot.erase(it);
-                        lc.fingerprints.erase(e);
-                    }
                     if (fp_corrupt_log < 10) {
-                        fprintf(stderr, "[fp-corrupt] tok=%llu L%d expert=%d fingerprint mismatch — forcing reload\n",
+                        fprintf(stderr, "[slot-fp] tok=%llu L%d expert=%d fingerprint mismatch\n",
                                 (unsigned long long) row_token_idx, logical, e);
                         ++fp_corrupt_log;
                     }
@@ -1117,20 +1136,15 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                     LLAMA_LOG_ERROR("moe_eval_callback: completion without lookup entry (L%d)\n", logical);
                 } else {
                     const auto h2d_start = std::chrono::steady_clock::now();
-                    ggml_backend_tensor_set(it->second.slot_tensor, c.pinned_buf,
-                                            it->second.write_off, c.blob_size);
+                    set_tensor_for_compute(s, it->second.slot_tensor, c.pinned_buf,
+                                           it->second.write_off, c.blob_size);
                     const auto h2d_end = std::chrono::steady_clock::now();
                     layer_load_stats.h2d_us += std::chrono::duration_cast<std::chrono::microseconds>(
                             h2d_end - h2d_start).count();
                 }
             }
 
-            // Phase M.7: fingerprint the loaded data for cross-step
-            // integrity verification.  We hash the first 1 KiB of the
-            // pinned buffer (which holds the source expert blob).  Only
-            // fingerprint the GATE kind so the verification read-back
-            // touches just one tensor per layer.
-            if (c.kind == EXPERT_GATE && c.blob_size > 0) {
+            if (debug_slot_fingerprint() && c.kind == EXPERT_GATE && c.blob_size > 0) {
                 size_t fp_sz = c.blob_size < 1024 ? (size_t) c.blob_size : 1024;
                 uint64_t fp = 0xcbf29ce484222325ULL;
                 const uint8_t * src = (const uint8_t *) c.pinned_buf;
@@ -1144,6 +1158,22 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         const auto wait_end = std::chrono::steady_clock::now();
         stall_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 wait_end - wait_start).count();
+    }
+
+    if (slot_ids_tensor && slot_ids_tensor->buffer) {
+        std::vector<int32_t> slot_ids_host(ids.size(), 0);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const int32_t e = ids[i];
+            auto it = lc.exp2slot.find(e);
+            if (it == lc.exp2slot.end()) {
+                LLAMA_LOG_ERROR("moe_eval_callback: missing slot mapping after residency L%d e%d\n",
+                        logical, e);
+                GGML_ABORT("MoE-offload: missing slot mapping");
+            }
+            slot_ids_host[i] = it->second;
+        }
+        set_tensor_for_compute(s, slot_ids_tensor, slot_ids_host.data(), 0,
+                               slot_ids_host.size() * sizeof(int32_t));
     }
 
     // Strategy (D-4): build slot_table host buffer (init 0, set hot entries).
@@ -1173,8 +1203,8 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     // scheduler's temporaries — the immediately-following `ggml_get_rows`
     // consumer will read what we just wrote.
     if (stt && stt->buffer) {
-        ggml_backend_tensor_set(stt, s.slot_table_host.data(), 0,
-                                s.slot_table_host.size() * sizeof(int32_t));
+        set_tensor_for_compute(s, stt, s.slot_table_host.data(), 0,
+                               s.slot_table_host.size() * sizeof(int32_t));
 
         // Phase M.2 diagnostic: force a full compute-stream drain after the
         // slot_table write. If this collapses streaming drift to ~0, the bug
@@ -1193,11 +1223,11 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             const char * bn = ggml_backend_buffer_name(stt->buffer);
             size_t nz = 0;
             for (auto v : s.slot_table_host) if (v != 0) ++nz;
-            fprintf(stderr, "[moe-d4] cb#%llu layer=%d uniq=%zu nz=%zu buf=%s stt=%p\n",
+            fprintf(stderr, "[moe-d4] cb#%llu layer=%d uniq=%zu nz=%zu buf=%s stt=%p slot_ids=%p\n",
                     (unsigned long long) s.topk_calls, logical,
-                    uniq.size(), nz, bn ? bn : "?", (void *) stt);
+                    uniq.size(), nz, bn ? bn : "?", (void *) stt, (void *) slot_ids_tensor);
         }
-    } else {
+    } else if (!slot_ids_tensor) {
         static bool warned = false;
         if (!warned) {
             warned = true;

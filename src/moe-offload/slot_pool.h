@@ -61,13 +61,13 @@ ggml_tensor * get_slot_table_tensor(int logical_layer);
 // (non-resident mode handled by the eval-callback in Phase D).
 bool prefetch_all_experts();
 
-// Phase D-1: slot_table input tensor registry. `remap_selected_experts` creates
-// one [1, n_expert] I32 input tensor per MoE layer per graph build and registers
-// it here associated with the topk tensor of the same graph build. Because the
-// graph can be rebuilt multiple times (different ubatch shapes, graph_reserve
-// passes) we must keep the (topk -> slot_table) association per build so the
-// eval-callback writes to the correct sibling tensor.
+// Phase D-1: remap tensor registry. `remap_selected_experts` registers the
+// top-k tensor so the eval-callback can stop immediately after it is computed.
+// In streaming mode it also registers a [n_expert_used, n_tokens] I32 tensor
+// that the callback fills directly with slot indices for downstream
+// MUL_MAT_ID. In full-residency mode the original expert IDs are used.
 void register_slot_table_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * slot_table);
+void register_slot_ids_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * slot_ids);
 void populate_slot_tables_identity();
 
 // Clear per-graph-build slot_table bookkeeping (topk->slot_table maps and the
