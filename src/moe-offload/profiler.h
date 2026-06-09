@@ -54,6 +54,11 @@ struct profile_summary_context {
     int n_prompt = 0;
     int n_gen = 0;
     int n_repeat = 1;
+    int n_ubatch_requested = 0;
+    int n_ubatch = 0;
+    uint32_t n_slots = 0;
+    uint32_t n_experts = 0;
+    bool streaming = false;
     double ttft_ms = 0.0;
     double tpot_ms = 0.0;
     double total_ms = 0.0;

@@ -23,7 +23,16 @@ void configure_slot_pool();
 void reset_slot_pool();
 
 // Returns the uniform slot count per MoE layer.
-uint32_t n_slots_per_layer();
+LLAMA_API uint32_t n_slots_per_layer();
+
+// Returns the routed expert count recorded in the MoE manifest.
+LLAMA_API uint32_t n_experts_per_layer();
+
+// Recommended effective ubatch for streaming mode. The recommendation is
+// derived from the current slot budget and model top-k. `safety` defaults to a
+// worst-case unique-expert bound when set to 1.0; lower values are more
+// conservative and values above 1.0 are diagnostic/optimistic.
+uint32_t recommended_ubatch(uint32_t requested, uint32_t n_expert_used, float safety);
 
 // Classifies the tensor name. Returns true if `tn` is a routed-expert weight on
 // a transformer layer listed in moe_offload.layer_ids. Fills logical index and
@@ -80,7 +89,7 @@ void reset_graph_state();
 // Phase D-2: streaming mode (n_slots < n_experts). When true, the loader does
 // NOT prefetch all experts; instead a per-layer LRU cache fills slots on demand
 // via the eval-callback below.
-bool streaming_mode();
+LLAMA_API bool streaming_mode();
 
 // Phase D-5: initialize the async I/O subsystem. Must be called once after
 // slot tensors have backing buffers. Idempotent (safe to call multiple times).

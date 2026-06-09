@@ -30,6 +30,7 @@ struct manifest {
     uint32_t version = 0;
     uint32_t n_layers = 0;             // logical MoE layer count (== layer_ids.size())
     uint32_t n_experts_per_layer = 0;
+    uint32_t n_expert_used = 0;         // model top-k routed experts per token, when present in GGUF metadata
     uint64_t expert_blob_size_max = 0;
     uint64_t data_offset = 0;          // absolute file byte offset of tensor data section
     std::string layout;

@@ -17,8 +17,10 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -34,6 +36,51 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     }
     throw std::runtime_error("Unsupported ctx type");
 }
+
+#ifdef LLAMA_MOE_OFFLOAD
+static bool llama_moe_env_is_off(const char * value) {
+    return value &&
+        (strcmp(value, "0") == 0 ||
+         strcmp(value, "off") == 0 ||
+         strcmp(value, "OFF") == 0 ||
+         strcmp(value, "false") == 0 ||
+         strcmp(value, "FALSE") == 0 ||
+         strcmp(value, "disabled") == 0 ||
+         strcmp(value, "DISABLED") == 0);
+}
+
+static float llama_moe_ubatch_safety() {
+    const char * value = getenv("LLAMA_MOE_UBATCH_SAFETY");
+    if (!value || !value[0]) {
+        return 1.0f;
+    }
+    char * end = nullptr;
+    const float parsed = strtof(value, &end);
+    if (end == value || !std::isfinite(parsed) || parsed <= 0.0f) {
+        LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_MOE_UBATCH_SAFETY=%s\n", __func__, value);
+        return 1.0f;
+    }
+    return parsed;
+}
+
+static uint32_t llama_moe_fixed_ubatch_from_env(uint32_t n_batch, bool * has_fixed) {
+    *has_fixed = false;
+    const char * value = getenv("LLAMA_MOE_STREAMING_UBATCH");
+    if (!value || !value[0] || strcmp(value, "auto") == 0 || strcmp(value, "AUTO") == 0 || llama_moe_env_is_off(value)) {
+        return 0;
+    }
+
+    char * end = nullptr;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || parsed == 0) {
+        LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_MOE_STREAMING_UBATCH=%s\n", __func__, value);
+        return 0;
+    }
+
+    *has_fixed = true;
+    return std::min<uint32_t>(n_batch, (uint32_t) parsed);
+}
+#endif
 
 llama_context::llama_context(
         const llama_model & model,
@@ -188,17 +235,24 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
 #ifdef LLAMA_MOE_OFFLOAD
-    // When MoE expert offloading is active with a streaming cache
-    // (n_slots < n_expert), the mul_mat_id mmq kernel can crash with large
-    // microbatches due to a known interaction between ggml_get_rows-remapped
-    // expert IDs and the mm_ids_helper kernel.  Cap ubatch to 8 as a safe
-    // workaround; full-residency mode (n_slots == n_expert) is unaffected.
     if (llama_moe::runtime_enabled() && llama_moe::streaming_mode()) {
-        constexpr uint32_t kMaxStreamingUbatch = 8;
-        if (cparams.n_ubatch > kMaxStreamingUbatch) {
-            LLAMA_LOG_WARN("%s: capping n_ubatch %u -> %u for MoE streaming safety\n",
-                    __func__, cparams.n_ubatch, kMaxStreamingUbatch);
-            cparams.n_ubatch = kMaxStreamingUbatch;
+        const uint32_t requested = cparams.n_ubatch;
+        bool has_fixed = false;
+        const uint32_t fixed = llama_moe_fixed_ubatch_from_env(cparams.n_batch, &has_fixed);
+
+        if (llama_moe_env_is_off(getenv("LLAMA_MOE_STREAMING_UBATCH"))) {
+            LLAMA_LOG_INFO("%s: MoE streaming ubatch auto-sizing disabled: requested=%u n_slots=%u top_k=%u\n",
+                    __func__, requested, llama_moe::n_slots_per_layer(), hparams.n_expert_used);
+        } else if (has_fixed) {
+            cparams.n_ubatch = fixed;
+            LLAMA_LOG_INFO("%s: MoE streaming ubatch fixed by LLAMA_MOE_STREAMING_UBATCH: requested=%u effective=%u n_slots=%u top_k=%u\n",
+                    __func__, requested, cparams.n_ubatch, llama_moe::n_slots_per_layer(), hparams.n_expert_used);
+        } else {
+            const float safety = llama_moe_ubatch_safety();
+            const uint32_t adaptive = llama_moe::recommended_ubatch(requested, hparams.n_expert_used, safety);
+            cparams.n_ubatch = adaptive;
+            LLAMA_LOG_INFO("%s: MoE streaming ubatch auto-sized: requested=%u effective=%u n_slots=%u top_k=%u safety=%.3g\n",
+                    __func__, requested, cparams.n_ubatch, llama_moe::n_slots_per_layer(), hparams.n_expert_used, (double) safety);
         }
     }
 #endif

@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include "moe-offload/runtime.h"
+#include "moe-offload/slot_pool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -45,6 +46,7 @@ struct bench_params {
     std::string moe_profile_summary;
     int n_gpu_layers = 99;
     int n_ctx = 4096;
+    int n_ubatch = 0;
 };
 
 static bool parse_args(int argc, char ** argv, bench_params & p) {
@@ -82,6 +84,9 @@ static bool parse_args(int argc, char ** argv, bench_params & p) {
         else if (value_for("--moe-profile-summary", p.moe_profile_summary)) {}
         else if (int_for("-ngl", p.n_gpu_layers)) {}
         else if (int_for("-c", p.n_ctx)) {}
+        else if (int_for("-ub", p.n_ubatch)) {}
+        else if (int_for("--ubatch", p.n_ubatch)) {}
+        else if (int_for("--ubatch-size", p.n_ubatch)) {}
         else if (value_for("-p", p.prompt)) {}
     }
     if (p.n_repeat < 1) p.n_repeat = 1;
@@ -262,7 +267,7 @@ static llama_token greedy_token(llama_context * ctx, int vocab_size) {
 int main(int argc, char ** argv) {
     bench_params p;
     if (!parse_args(argc, argv, p)) {
-        fprintf(stderr, "Usage: llama-moe-bench --model <path> --pp N --tg N [--repeat N] [--moe-cache-vram-mb MB] [--moe-predictor lru|eamc] [--moe-eamc-path PATH] [--moe-profile-csv PATH] [--moe-profile-summary PATH]\n");
+        fprintf(stderr, "Usage: llama-moe-bench --model <path> --pp N --tg N [--repeat N] [--moe-cache-vram-mb MB] [--moe-predictor lru|eamc] [--moe-eamc-path PATH] [--moe-profile-csv PATH] [--moe-profile-summary PATH] [-ub N]\n");
         return 1;
     }
 
@@ -295,6 +300,9 @@ int main(int argc, char ** argv) {
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = p.n_ctx;
     ctx_params.n_batch = std::max(2048, p.n_prompt);
+    if (p.n_ubatch > 0) {
+        ctx_params.n_ubatch = (uint32_t) p.n_ubatch;
+    }
 
     llama_model * model = llama_model_load_from_file(p.model.c_str(), model_params);
     if (!model) {
@@ -367,6 +375,11 @@ int main(int argc, char ** argv) {
         summary_ctx.n_prompt = n_prompt_tokens;
         summary_ctx.n_gen = p.n_gen;
         summary_ctx.n_repeat = (int) std::max<size_t>(1, std::max(ttft_ms.size(), total_ms.size()));
+        summary_ctx.n_ubatch_requested = (int) ctx_params.n_ubatch;
+        summary_ctx.n_ubatch = ctx ? (int) llama_n_ubatch(ctx) : 0;
+        summary_ctx.n_slots = llama_moe::n_slots_per_layer();
+        summary_ctx.n_experts = llama_moe::n_experts_per_layer();
+        summary_ctx.streaming = llama_moe::streaming_mode();
         summary_ctx.ttft_ms = average_or_zero(ttft_ms);
         summary_ctx.tpot_ms = average_or_zero(tpot_ms);
         summary_ctx.total_ms = total_ms.empty() ? summary_ctx.ttft_ms : average_or_zero(total_ms);

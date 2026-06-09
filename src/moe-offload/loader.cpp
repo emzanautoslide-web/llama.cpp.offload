@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 
 namespace llama_moe {
@@ -24,11 +25,7 @@ std::string default_eamc_path(const std::string & model_path) {
     return model_path + ".eamc";
 }
 
-bool read_u32(const gguf_context * ctx, const char * key, uint32_t & value) {
-    const int64_t kid = gguf_find_key(ctx, key);
-    if (kid < 0) {
-        return false;
-    }
+bool read_u32_kv(const gguf_context * ctx, int64_t kid, uint32_t & value) {
     switch (gguf_get_kv_type(ctx, kid)) {
         case GGUF_TYPE_UINT32: value = gguf_get_val_u32(ctx, kid); return true;
         case GGUF_TYPE_UINT16: value = gguf_get_val_u16(ctx, kid); return true;
@@ -36,6 +33,33 @@ bool read_u32(const gguf_context * ctx, const char * key, uint32_t & value) {
         case GGUF_TYPE_INT32:  value = (uint32_t) gguf_get_val_i32(ctx, kid); return true;
         default: return false;
     }
+}
+
+bool read_u32(const gguf_context * ctx, const char * key, uint32_t & value) {
+    const int64_t kid = gguf_find_key(ctx, key);
+    if (kid < 0) {
+        return false;
+    }
+    return read_u32_kv(ctx, kid, value);
+}
+
+bool has_suffix(const char * value, const char * suffix) {
+    if (!value || !suffix) {
+        return false;
+    }
+    const size_t value_len = std::strlen(value);
+    const size_t suffix_len = std::strlen(suffix);
+    return value_len >= suffix_len && std::strcmp(value + value_len - suffix_len, suffix) == 0;
+}
+
+bool read_suffix_u32(const gguf_context * ctx, const char * suffix, uint32_t & value) {
+    const int n_kv = gguf_get_n_kv(ctx);
+    for (int i = 0; i < n_kv; ++i) {
+        if (has_suffix(gguf_get_key(ctx, i), suffix) && read_u32_kv(ctx, i, value)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool read_u64(const gguf_context * ctx, const char * key, uint64_t & value) {
@@ -77,6 +101,7 @@ manifest inspect_manifest(const gguf_context * ctx, const std::string & source_p
     result.data_offset = (uint64_t) gguf_get_data_offset(ctx);
     read_u32(ctx, "moe_offload.n_moe_layers", result.n_layers);
     read_u32(ctx, "moe_offload.n_experts_per_layer", result.n_experts_per_layer);
+    read_suffix_u32(ctx, ".expert_used_count", result.n_expert_used);
     read_u64(ctx, "moe_offload.expert_blob_size_max", result.expert_blob_size_max);
     result.layout = read_string(ctx, "moe_offload.layout");
 

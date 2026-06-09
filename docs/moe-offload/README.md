@@ -27,11 +27,20 @@ The current repacker writes a stock-loadable GGUF with page-aligned tensor data 
   --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
   --moe-offload `
   --moe-cache-vram-mb 8000 `
-  --moe-predictor lru `
+  --moe-predictor eamc `
   -p "Hello" -n 32
 ```
 
 `--moe-predictor` accepts `lru` or `eamc`. `--moe-eamc-path PATH` selects the EAMC predictor sidecar; when omitted with `--moe-predictor eamc`, the runtime uses the model path with a `.eamc` suffix. `--moe-profile-csv PATH` and `--moe-profile-summary PATH` write profiling data.
+
+In streaming mode (`n_slots < n_experts`), the runtime auto-sizes the effective
+`n_ubatch` from the cache VRAM budget and model top-k instead of applying the
+old fixed cap of 8. Very small cache budgets still reserve at least one
+token's top-k working set per layer; below that point the runtime warns that it
+is using the minimum viable slot count. Set `LLAMA_MOE_STREAMING_UBATCH=N` for
+a fixed diagnostic value, `LLAMA_MOE_STREAMING_UBATCH=off` to disable
+auto-sizing, or `LLAMA_MOE_UBATCH_SAFETY=F` to tune the slot-budget safety
+factor.
 
 ## Bench
 
@@ -39,14 +48,16 @@ The current repacker writes a stock-loadable GGUF with page-aligned tensor data 
 .\build-moe\bin\Release\llama-moe-bench.exe `
   --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
   --pp 1024 --tg 256 --repeat 3 `
-  --moe-cache-vram-mb 8000 --moe-predictor eamc `
+  --moe-cache-vram-mb 12000 --moe-predictor eamc `
   --moe-eamc-path C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.eamc `
   --moe-profile-csv moe-profile.csv `
-  --moe-profile-summary moe-summary.txt
+  --moe-profile-summary moe-summary.txt `
+  -ub 16
 ```
 
 The bench tool enables MoE offload automatically, runs prefill + decode loops,
-and always prints the summary report to stdout. If `--moe-profile-summary` is
+and always prints the summary report to stdout. It accepts `-ub`, `--ubatch`,
+and `--ubatch-size` for explicit prefill-ubatch measurements. If `--moe-profile-summary` is
 set, `llama-moe-bench` writes the same §4.7 report to that path after all
 repeats complete. During long runs, it also checkpoints the same summary file
 after prefill and after each completed repeat, so the file appears before the
@@ -57,8 +68,10 @@ full benchmark finishes. It intentionally does not use the runtime
 Example summary:
 ```
 model: Qwen3.5-35B-A3B Q4_K_M
-predictor: eamc      cache: 8000 MB   ssd: C:
+predictor: eamc      cache: 12000 MB   ssd: C:
 n_prompt: 1024  n_gen: 256  repeats: 3
+
+ubatch: requested=16 effective=16  slots=145/256  mode=streaming
 
 phase     tokens   total_ms   per_token_ms   tok/s
 prefill     1024     1320.4          1.29     774
@@ -113,7 +126,7 @@ Implemented in this slice:
 - Slot-cache model and profiling CSV/summary plumbing, including `pred_us` predictor overhead.
 - Guarded hooks at model load, decode request boundaries, and MoE top-k graph construction.
 - `llama-moe-repack` and `llama-moe-bench` targets.
-- **D-4**: Pre-allocated slot_table tensors via `create_unfiled_tensor`; zero-init of all slot tensors; ubatch auto-cap to 8 in streaming mode.
+- **D-4**: Pre-allocated slot_table tensors via `create_unfiled_tensor`; zero-init of all slot tensors; adaptive streaming ubatch sizing from the slot/VRAM budget.
 - **D-5**: Threaded I/O worker (`src/moe-offload/io.{h,cpp}`).
 - **E**: Per-layer CSV profiling rows; snapshot summary; LRU/EAMC predictor wired into eval-callback eviction.
 - **F**: `llama-moe-bench` emits the §4.7-style stdout/file summary and writes nonempty CSV rows when requested.
@@ -123,7 +136,7 @@ Implemented in this slice:
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
 - **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
 - **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. CUDA `MUL_MAT_ID` on `.slot` tensors bypasses the specialized MMVQ/MMQ/MMF paths and uses the generic sorted path for correctness-first validation.
-- **L**: IO worker shutdown wired into `llama_context::~llama_context()`; small-cache (≤8000 MiB) and multi-token-prompt streaming deadlocks fixed by enlarging the IO buffer pool to cover worst-case in-flight misses and by excluding just-reserved experts from LRU/predictor eviction within the same callback.
+- **L**: IO worker shutdown wired into `llama_context::~llama_context()`; small-cache and multi-token-prompt streaming deadlocks fixed by excluding just-reserved experts from LRU/predictor eviction within the same callback. Larger-ubatch miss loading now submits and drains I/O in chunks instead of requiring the pinned-buffer pool to cover every blob for the layer.
 
 ## Correctness
 
@@ -236,16 +249,33 @@ for runtime prereqs and invocation details.
 ```
 moe_eval_callback: n_uniq=96 exceeds n_slots=48
 ```
-Increase `--moe-cache-vram-mb` so `n_slots >= worst-case unique experts per batch`,
-or reduce batch size with `-ub`.
+Default auto-sizing should avoid this during normal streaming runs by reducing
+the effective ubatch as far as 1 and by reserving the model top-k slots as the
+minimum viable cache. If this appears, check for diagnostic overrides such as
+`LLAMA_MOE_STREAMING_UBATCH=off`, a forced `LLAMA_MOE_STREAMING_UBATCH=N` that
+is too large for the cache, or a forced `LLAMA_MOE_MIN_SLOTS` below model
+top-k.
 
-### Streaming mode caps ubatch to 8
-When `--moe-cache-vram-mb` is small enough that `n_slots < n_expert` (streaming mode),
-the ubatch is automatically capped to **8** to avoid a known `ggml_get_rows`→`mm_ids_helper`
-kernel crash. This reduces prefill throughput (~2-5× slowdown). To restore full throughput,
-use full residency: `--moe-cache-vram-mb 99999`.
+### Adaptive streaming ubatch
+Streaming mode auto-sizes `n_ubatch` from `n_slots / top_k` and rounds to a
+common graph size. Larger `--moe-cache-vram-mb` values therefore allow larger
+prefill microbatches. The startup log prints the requested and effective
+ubatch. If the budget fits fewer than top-k slots, startup warns and reserves
+the minimum one-token working set so inference still runs, just with effective
+ubatch 1.
+
+For diagnostics:
+
+```powershell
+$env:LLAMA_MOE_STREAMING_UBATCH="16"   # force a fixed effective ubatch
+$env:LLAMA_MOE_STREAMING_UBATCH="off"  # disable auto-sizing
+$env:LLAMA_MOE_UBATCH_SAFETY="0.5"     # choose a more conservative auto value
+$env:LLAMA_MOE_MIN_SLOTS="8"           # override the minimum working set
+```
 
 ### CUDA illegal memory access at launch_mul_mat_q
-This is the ubatch-capping issue above. Ensure you are using the latest build
-which auto-caps ubatch to 8 in streaming mode. If you need larger ubatch,
-use full residency or investigate `ggml/src/ggml-cuda/mmq.cu` + `mmid.cu`.
+The old fixed-cap workaround targeted an older remap path. Current streaming
+uses callback-filled slot-id tensors and generic `.slot` `MUL_MAT_ID`.
+Large-ubatch failures should now surface as `n_uniq exceeds n_slots` or an I/O
+progress error; a CUDA illegal access is a regression and should be captured
+with the cache size, effective ubatch, and prompt.

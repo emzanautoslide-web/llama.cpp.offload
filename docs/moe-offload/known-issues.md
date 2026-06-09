@@ -1,20 +1,91 @@
 # MoE Offload Known Issues
 
-Status as of the MVP closeout work on 2026-06-05.
+Status as of the adaptive ubatch and interactive-mode diagnosis work on
+2026-06-09.
 
 ## Open
 
-### Streaming `n_ubatch` Cap
+### `llama-completion` Conversation Mode Can Produce Bad Interactive Turns
 
-In streaming mode (`n_slots < n_experts`), `llama_context` still caps
-`n_ubatch` at 8. The cap is acceptable for MVP because the forced-eviction
-golden-logit gate passes with `-UBatch 8`, but removing it remains post-MVP
-CUDA/runtime work.
+Observed with `Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`,
+`llama-completion.exe`, `--moe-offload`, and an interactive conversation. A
+simple user turn such as:
+
+```text
+what is the capital of France
+```
+
+can produce an incorrect transcript that echoes user text or role labels
+instead of answering `Paris`.
+
+Current diagnosis:
+
+- This is reproducible in `llama-completion` conversation mode, but raw
+  completion mode (`-no-cnv`) with the same offloaded model can answer the
+  same factual prompt correctly.
+- `llama-completion` auto-enables conversation mode when the model has a chat
+  template. Passing `-p "Hello"` in that mode pre-starts the conversation; it
+  is not treated as a system prompt. The tool prints a warning for this case.
+- The Qwen3.5 chat template in this GGUF is Jinja-based. A deterministic
+  single-turn test without `--jinja` echoed the question and ended; enabling
+  `--jinja` produced an answer containing `Paris`.
+- The MoE offload path still has unconditional `[moe-d4]` `stderr` debug
+  prints, including periodic callback counters. In an interactive terminal
+  these lines interleave with generated tokens and make the visible transcript
+  look corrupted even when they are not model tokens.
+- This has not yet been proven to be a slot-cache/logit correctness bug. The
+  current evidence points first at chat-template invocation and noisy MoE
+  diagnostics in interactive mode.
+
+Workarounds while this is open:
+
+- For one-shot factual checks, use raw completion mode:
+
+  ```powershell
+  .\build-moe\bin\Release\llama-completion.exe `
+    --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+    --moe-offload `
+    --moe-cache-vram-mb 8000 `
+    --moe-predictor lru `
+    -no-cnv `
+    -p "Q: what is the capital of France?`nA:" `
+    -n 32
+  ```
+
+- For chat mode with this model, prefer `--jinja` and use `-sys` for system
+  instructions instead of seeding the session with `-p "Hello"`.
+- Redirect `stderr` when checking answer text, because current `[moe-d4]`
+  diagnostics are not quiet enough for interactive use.
+
+Next fix:
+
+- Gate or remove the unconditional `[moe-d4]` prints.
+- Add a chat-template smoke test for `llama-completion -cnv --jinja -st`.
+- Re-run a golden-logit check on the formatted chat prompt before treating this
+  as fully closed.
+
+### Streaming Capacity Diagnostics
+
+Streaming mode (`n_slots < n_experts`) no longer has a fixed `n_ubatch <= 8`
+rewrite. `llama_context` now auto-sizes the effective ubatch from the slot
+budget and model top-k, and the slot pool reserves at least the one-token
+top-k working set per layer. The graph still has this internal constraint:
+
+```text
+unique experts selected by one MoE callback <= n_slots
+```
+
+Default auto mode keeps the worst-case bound within that capacity. The callback
+still aborts with a clear `n_uniq exceeds n_slots` diagnostic if diagnostics
+force an unsafe effective ubatch or force the minimum slot count below top-k.
 
 Impact:
 
-- Prefill throughput is lower than an uncapped run.
-- Full-residency mode is the workaround when large ubatches are required.
+- Larger VRAM budgets can use larger streaming prefill ubatches.
+- Very small caches shrink to effective ubatch 1 and may reserve slightly more
+  than the requested cache budget to keep one token runnable.
+- Explicit diagnostics can use `LLAMA_MOE_STREAMING_UBATCH=off|N`,
+  `LLAMA_MOE_UBATCH_SAFETY=F`, and `LLAMA_MOE_MIN_SLOTS=N`.
 
 ### CUDA Top-k MoE Fusion Disabled
 
@@ -61,9 +132,20 @@ The following remain outside MVP scope:
 - Learned predictors.
 - Speculative prefetch/decoding.
 - FineMoE-style splitting.
-- Removing the streaming ubatch cap.
+- True sub-token expert-rank chunking for running with fewer than top-k slots
+  per layer without reserving the minimum working set.
 
 ## Closed
+
+### Fixed Streaming UBatch Cap
+
+The old unconditional streaming cap of `n_ubatch <= 8` has been replaced by
+adaptive sizing. The recommendation is derived from `n_slots / top_k` and is
+bounded by the requested ubatch, with a minimum effective ubatch of 1. The slot
+pool reads top-k from GGUF metadata and reserves that many slots per layer as
+the minimum viable cache. The miss-loading path now submits and drains I/O in
+chunks so larger prefill ubatches do not require a pinned buffer for every blob
+in a layer at once.
 
 ### Streaming Golden-Logit Drift
 

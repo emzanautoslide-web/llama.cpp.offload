@@ -53,6 +53,16 @@ struct buffer_pool {
         return p;
     }
 
+    void * try_acquire() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (free_list.empty()) {
+            return nullptr;
+        }
+        void * p = free_list.back();
+        free_list.pop_back();
+        return p;
+    }
+
     void release(void * p) {
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -235,11 +245,17 @@ void io_shutdown() { g_worker.stop(); }
 
 void * io_acquire_buffer() { return g_worker.pool.acquire(); }
 
+void * io_try_acquire_buffer() { return g_worker.pool.try_acquire(); }
+
 void io_release_buffer(void * buf) { g_worker.pool.release(buf); }
 
 bool io_submit(struct io_request req) {
     g_worker.outstanding.fetch_add(1, std::memory_order_relaxed);
-    return g_worker.queue.push(req);
+    if (!g_worker.queue.push(req)) {
+        g_worker.outstanding.fetch_sub(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
 }
 
 int io_wait_all() {

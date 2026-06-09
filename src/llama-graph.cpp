@@ -2,6 +2,7 @@
 
 #ifdef LLAMA_MOE_OFFLOAD
 #include "moe-offload/runtime.h"
+#include "moe-offload/slot_pool.h"
 #endif
 
 #include "llama-impl.h"
@@ -951,7 +952,11 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used),
+    n_expert_used    (cparams.warmup
+#ifdef LLAMA_MOE_OFFLOAD
+            && !(llama_moe::runtime_enabled() && llama_moe::streaming_mode())
+#endif
+            ? hparams.n_expert : hparams.n_expert_used),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),

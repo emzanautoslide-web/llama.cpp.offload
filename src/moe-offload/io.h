@@ -64,6 +64,9 @@ void io_shutdown();
 // Acquire a pinned staging buffer from the pool. Blocks if none available.
 void * io_acquire_buffer();
 
+// Non-blocking variant. Returns nullptr if no staging buffer is currently free.
+void * io_try_acquire_buffer();
+
 // Release a pinned buffer back to the free pool.
 void io_release_buffer(void * buf);
 

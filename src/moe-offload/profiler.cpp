@@ -141,6 +141,15 @@ std::string format_summary(
         << "  cache: " << ctx.cache_mb << " MB"
         << "   ssd: " << ctx.storage << '\n';
     out << "n_prompt: " << ctx.n_prompt << "  n_gen: " << ctx.n_gen << "  repeats: " << ctx.n_repeat << "\n\n";
+    if (ctx.n_ubatch > 0) {
+        out << "ubatch: requested=" << ctx.n_ubatch_requested
+            << " effective=" << ctx.n_ubatch;
+        if (ctx.n_slots > 0 || ctx.n_experts > 0) {
+            out << "  slots=" << ctx.n_slots << "/" << ctx.n_experts
+                << "  mode=" << (ctx.streaming ? "streaming" : "full-residency");
+        }
+        out << "\n\n";
+    }
 
     out << "phase     tokens   total_ms   per_token_ms   tok/s\n";
     out << "prefill   " << std::setw(6) << ctx.n_prompt
