@@ -7,6 +7,7 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -161,17 +162,23 @@ struct io_worker {
                 const auto read_start = std::chrono::steady_clock::now();
                 int rc = _fseeki64(fp, (int64_t) req.file_offset, SEEK_SET);
                 if (rc != 0) {
+                    req.ok       = false;
+                    req.io_error = errno;
+                    req.bytes_read = 0;
                     fprintf(stderr, "[moe-io] seek to %llu failed\n",
                             (unsigned long long) req.file_offset);
-                    pool.release(req.pinned_buf);
-                    outstanding.fetch_sub(1, std::memory_order_relaxed);
+                    done.push(req);
+                    outstanding.fetch_sub(1, std::memory_order_release);
                     continue;
                 }
                 size_t got = fread(req.pinned_buf, 1, req.blob_size, fp);
+                req.bytes_read = got;
                 if (got != req.blob_size) {
+                    req.ok       = false;
+                    req.io_error = ferror(fp) ? errno : 0;
                     fprintf(stderr, "[moe-io] short read: got %zu of %zu\n", got, req.blob_size);
-                    pool.release(req.pinned_buf);
-                    outstanding.fetch_sub(1, std::memory_order_relaxed);
+                    done.push(req);
+                    outstanding.fetch_sub(1, std::memory_order_release);
                     continue;
                 }
                 const auto read_end = std::chrono::steady_clock::now();
@@ -205,7 +212,7 @@ struct io_worker {
                 // Push to completed list — caller drains, performs sync H2D
                 // fallback if needed, waits on the event, then recycles.
                 done.push(req);
-                outstanding.fetch_sub(1, std::memory_order_relaxed);
+                outstanding.fetch_sub(1, std::memory_order_release);
             }
         }
     }
@@ -250,9 +257,12 @@ void * io_try_acquire_buffer() { return g_worker.pool.try_acquire(); }
 void io_release_buffer(void * buf) { g_worker.pool.release(buf); }
 
 bool io_submit(struct io_request req) {
-    g_worker.outstanding.fetch_add(1, std::memory_order_relaxed);
+    req.ok = true;
+    req.bytes_read = 0;
+    req.io_error = 0;
+    g_worker.outstanding.fetch_add(1, std::memory_order_acq_rel);
     if (!g_worker.queue.push(req)) {
-        g_worker.outstanding.fetch_sub(1, std::memory_order_relaxed);
+        g_worker.outstanding.fetch_sub(1, std::memory_order_release);
         return false;
     }
     return true;
@@ -260,7 +270,7 @@ bool io_submit(struct io_request req) {
 
 int io_wait_all() {
     // Spin until all outstanding requests complete
-    while (g_worker.outstanding.load(std::memory_order_relaxed) > 0) {
+    while (g_worker.outstanding.load(std::memory_order_acquire) > 0) {
         std::this_thread::yield();
     }
     // Drain completed items — caller does H2D and releases buffers
@@ -273,7 +283,7 @@ std::vector<io_request> io_drain_completed() {
 }
 
 int io_outstanding() {
-    return g_worker.outstanding.load(std::memory_order_relaxed);
+    return g_worker.outstanding.load(std::memory_order_acquire);
 }
 
 // ---------------------------------------------------------------------------

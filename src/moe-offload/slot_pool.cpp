@@ -12,8 +12,10 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -114,6 +116,24 @@ slot_pool_state & state() {
     return instance;
 }
 
+uint32_t min_viable_slots(const manifest & mf) {
+    const uint32_t n_experts = mf.n_experts_per_layer;
+    if (n_experts == 0) {
+        return 0;
+    }
+
+    uint32_t n_min = mf.n_expert_used > 0 ? mf.n_expert_used : 8;
+    if (const char * env = std::getenv("LLAMA_MOE_MIN_SLOTS")) {
+        char * end = nullptr;
+        const unsigned long parsed = std::strtoul(env, &end, 10);
+        if (end != env && parsed > 0) {
+            n_min = (uint32_t) parsed;
+        }
+    }
+
+    return std::min(n_min, n_experts);
+}
+
 uint32_t compute_n_slots(const runtime_options & opts, const manifest & mf) {
     if (mf.n_experts_per_layer == 0) {
         return 0;
@@ -136,6 +156,12 @@ uint32_t compute_n_slots(const runtime_options & opts, const manifest & mf) {
             }
         }
     }
+    const uint32_t n_min = min_viable_slots(mf);
+    if (n < n_min) {
+        LLAMA_LOG_WARN("%s: MoE cache budget fits only %u slots/layer; reserving minimum viable %u slots/layer (top_k=%u)\n",
+                __func__, n, n_min, mf.n_expert_used);
+        n = n_min;
+    }
     if (n < 1) n = 1;
     if (n > mf.n_experts_per_layer) n = mf.n_experts_per_layer;
     return n;
@@ -147,6 +173,20 @@ llm_tensor base_tensor_of(llm_tensor t) {
 
 bool debug_slot_fingerprint() {
     static const bool enabled = std::getenv("LLAMA_MOE_DEBUG_SLOT_FP") != nullptr;
+    return enabled;
+}
+
+bool debug_d4_trace() {
+    static const bool enabled =
+        std::getenv("LLAMA_MOE_DEBUG_D4") != nullptr ||
+        std::getenv("LLAMA_MOE_DEBUG_TRACE") != nullptr;
+    return enabled;
+}
+
+bool debug_load_trace() {
+    static const bool enabled =
+        std::getenv("LLAMA_MOE_DEBUG_LOADS") != nullptr ||
+        debug_d4_trace();
     return enabled;
 }
 
@@ -230,6 +270,38 @@ uint32_t n_slots_per_layer() {
     return s.n_slots;
 }
 
+uint32_t n_experts_per_layer() {
+    const manifest & mf = get_manifest();
+    return mf.n_experts_per_layer;
+}
+
+uint32_t recommended_ubatch(uint32_t requested, uint32_t n_expert_used, float safety) {
+    const uint32_t n_slots = n_slots_per_layer();
+    if (n_slots == 0 || n_expert_used == 0) {
+        return requested;
+    }
+    if (!std::isfinite(safety) || safety <= 0.0f) {
+        safety = 1.0f;
+    }
+
+    const double raw = std::floor((double) n_slots * (double) safety / (double) n_expert_used);
+    uint32_t target = raw > 0.0 ? (uint32_t) raw : 1u;
+    target = std::max<uint32_t>(1, target);
+    target = std::min(target, requested);
+
+    // Keep the auto setting on common graph/cache shapes. Explicit diagnostic
+    // values can still be forced with LLAMA_MOE_STREAMING_UBATCH=N.
+    static constexpr uint32_t allowed[] = {
+        2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1,
+    };
+    for (uint32_t value : allowed) {
+        if (target >= value) {
+            return value;
+        }
+    }
+    return target;
+}
+
 bool should_intercept(const LLM_TN_IMPL & tn, int * out_logical_layer, expert_kind * out_kind) {
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
@@ -274,7 +346,7 @@ ggml_tensor * intercept_expert_tensor(
     }
 
     static int intercept_cnt = 0;
-    if (intercept_cnt < 4) {
+    if (debug_d4_trace() && intercept_cnt < 4) {
         fprintf(stderr, "[moe-d4] intercept_expert_tensor ENTER #%d L%d k%d tn=%s\n",
                 intercept_cnt, logical_layer, (int)kind, tn.str().c_str());
     }
@@ -323,7 +395,7 @@ ggml_tensor * intercept_expert_tensor(
     }
 
     // D-4 DEBUG: verify slot tensor strides match source metadata strides
-    if (logical_layer == 0 && kind == EXPERT_GATE) {
+    if (debug_d4_trace() && logical_layer == 0 && kind == EXPERT_GATE) {
         fprintf(stderr, "[moe-d4] slot tensor %s: type=%s ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu]\n",
                 slot_name.c_str(), ggml_type_name(slot->type),
                 (long long)slot->ne[0], (long long)slot->ne[1], (long long)slot->ne[2],
@@ -358,17 +430,19 @@ ggml_tensor * intercept_expert_tensor(
                     GGML_OP_GET_ROWS, { (int64_t) 1, n_expert });
             if (stt) {
                 s.slot_table_tensors[logical_layer] = stt;
-                fprintf(stderr, "[moe-d4] created %s L%d ne=[%lld,%lld] buf=%s has_buf=%d\n",
-                        st_name, logical_layer,
-                        (long long) stt->ne[0], (long long) stt->ne[1],
-                        stt->buffer ? ggml_backend_buffer_name(stt->buffer) : "NULL",
-                        stt->buffer ? 1 : 0);
+                if (debug_d4_trace()) {
+                    fprintf(stderr, "[moe-d4] created %s L%d ne=[%lld,%lld] buf=%s has_buf=%d\n",
+                            st_name, logical_layer,
+                            (long long) stt->ne[0], (long long) stt->ne[1],
+                            stt->buffer ? ggml_backend_buffer_name(stt->buffer) : "NULL",
+                            stt->buffer ? 1 : 0);
+                }
             } else {
-                fprintf(stderr, "[moe-d4] FAILED create_unfiled_tensor for %s L%d\n",
-                        st_name, logical_layer);
+                LLAMA_LOG_WARN("%s: failed to create %s for logical layer %d\n",
+                        __func__, st_name, logical_layer);
             }
         } else if (logical_layer >= 0) {
-            if ((size_t) logical_layer >= stvsz) {
+            if (debug_d4_trace() && (size_t) logical_layer >= stvsz) {
                 fprintf(stderr, "[moe-d4] slot_table_tensors OOB: L%d >= size=%zu\n",
                         logical_layer, stvsz);
             }
@@ -405,9 +479,13 @@ ggml_tensor * get_slot_table_tensor(int logical_layer) {
 }
 
 bool prefetch_all_experts() {
-    fprintf(stderr, "[moe-d4] prefetch_all_experts ENTER\n");
+    if (debug_d4_trace()) {
+        fprintf(stderr, "[moe-d4] prefetch_all_experts ENTER\n");
+    }
     if (!runtime_enabled()) {
-        fprintf(stderr, "[moe-d4] prefetch_all_experts: runtime disabled, skip\n");
+        if (debug_d4_trace()) {
+            fprintf(stderr, "[moe-d4] prefetch_all_experts: runtime disabled, skip\n");
+        }
         return true;
     }
     const manifest & mf = get_manifest();
@@ -430,7 +508,9 @@ bool prefetch_all_experts() {
         const int64_t t_z = ggml_time_us();
         size_t n_zeroed = 0;
         ggml_tensor * last_slot = nullptr;
-        fprintf(stderr, "[moe-d4] prefetch_all_experts: starting zero-init of slot tensors...\n");
+        if (debug_d4_trace()) {
+            fprintf(stderr, "[moe-d4] prefetch_all_experts: starting zero-init of slot tensors...\n");
+        }
         for (uint32_t li = 0; li < mf.n_layers; ++li) {
             for (int k = 0; k < EXPERT_KIND_COUNT; ++k) {
                 ggml_tensor * slot = get_slot_tensor((int) li, (expert_kind) k);
@@ -450,13 +530,17 @@ bool prefetch_all_experts() {
             uint8_t dummy = 0;
             ggml_backend_tensor_set(last_slot, &dummy, 0, 1);
         }
-        fprintf(stderr, "[moe-d4] prefetch_all_experts: zeroed %zu slot tensors in %.2f ms (incl sync)\n",
-                n_zeroed, (ggml_time_us() - t_z) / 1000.0);
+        if (debug_d4_trace()) {
+            fprintf(stderr, "[moe-d4] prefetch_all_experts: zeroed %zu slot tensors in %.2f ms (incl sync)\n",
+                    n_zeroed, (ggml_time_us() - t_z) / 1000.0);
+        }
     }
 
     if (n_slots < mf.n_experts_per_layer) {
-        fprintf(stderr, "[moe-d4] prefetch_all_experts: skipping prefetch (n_slots=%u < n_experts=%u; streaming mode)\n",
-                n_slots, mf.n_experts_per_layer);
+        if (debug_d4_trace()) {
+            fprintf(stderr, "[moe-d4] prefetch_all_experts: skipping prefetch (n_slots=%u < n_experts=%u; streaming mode)\n",
+                    n_slots, mf.n_experts_per_layer);
+        }
         return true;
     }
 
@@ -543,15 +627,17 @@ void register_slot_table_for_topk(int logical_layer, ggml_tensor * topk, ggml_te
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.configured || !topk || !slot_table) {
-        fprintf(stderr, "[moe-d4] register_slot_table_for_topk SKIP: cfg=%d topk=%p st=%p L=%d\n",
-                s.configured ? 1 : 0, (void*)topk, (void*)slot_table, logical_layer);
+        if (debug_d4_trace()) {
+            fprintf(stderr, "[moe-d4] register_slot_table_for_topk SKIP: cfg=%d topk=%p st=%p L=%d\n",
+                    s.configured ? 1 : 0, (void*)topk, (void*)slot_table, logical_layer);
+        }
         return;
     }
     s.topk_to_slot_table[topk]   = slot_table;
     s.topk_to_logical[topk]      = logical_layer;
     s.all_slot_tables.push_back(slot_table);
     static int reg_cnt = 0;
-    if (reg_cnt < 4) {
+    if (debug_d4_trace() && reg_cnt < 4) {
         fprintf(stderr, "[moe-d4] register_slot_table_for_topk #%d L=%d topk=%p st=%p st->buf=%s\n",
                 reg_cnt, logical_layer, (void*)topk, (void*)slot_table,
                 slot_table->buffer ? ggml_backend_buffer_name(slot_table->buffer) : "NULL");
@@ -709,7 +795,7 @@ bool load_expert_into_slot(slot_pool_state & s, const manifest & mf,
         }
         // D-3: dump all loads (capped) so we can verify slot_off math at slots beyond ~16.
         static int dump = 0;
-        if (dump < 3000) {
+        if (debug_load_trace() && dump < 3000) {
             ++dump;
             const char * bname = slot_tensor->buffer ? ggml_backend_buffer_name(slot_tensor->buffer) : "<null>";
             fprintf(stderr, "[moe-d3] load#%d L%u e%d k%d slot=%d rec.size=%llu stride=%zu write_off=%zu tensor_off=%zu buf_size=%zu buf=%s data=%p\n",
@@ -957,8 +1043,25 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         ggml_tensor * slot_tensor;
         size_t        write_off;
     };
+    struct miss_blob {
+        int32_t       expert;
+        int           kind;
+        int32_t       slot;
+        ggml_tensor * slot_tensor;
+        size_t        write_off;
+        size_t        blob_size;
+        uint64_t      file_offset;
+        char *        gpu_dst;
+    };
     std::unordered_map<void *, miss_meta> miss_lookup;
+    std::vector<miss_blob> miss_blobs;
     int submitted_misses = 0;
+    int completed_misses = 0;
+    int64_t stall_us = 0;
+
+    // Phase I: per-miss h2d timing events stashed for elapsed-time query at
+    // end_request. Owned by the pending_profile_row we create below.
+    std::vector<std::pair<void *, void *>> h2d_events_for_row;
 
     // Phase L.2: track experts reserved in THIS callback so the eviction
     // path cannot pick them as victims. Without this, the LRU/EAMC score
@@ -1025,10 +1128,9 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             ++dbg_evictions;
         }
 
-        // Phase H: submit one async read per (kind) into the slot's GPU
-        // address. The worker freads into a pinned staging buffer and then
-        // issues cudaMemcpyAsync on the dedicated MoE H2D stream, recording
-        // an event. The callback waits on those events below.
+        // Queue one blob load per expert kind. Submission happens below in a
+        // chunked submit/drain loop, so larger ubatches do not require enough
+        // pinned buffers for every miss in this layer at once.
         for (int k = 0; k < EXPERT_KIND_COUNT; ++k) {
             ggml_tensor * slot_tensor = s.slot_tensors[logical][k];
             if (!slot_tensor) continue;
@@ -1050,36 +1152,16 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 GGML_ABORT("MoE-offload: slot OOB");
             }
 
-            void * pinned = io_acquire_buffer();
-            io_request req{};
-            req.layer       = logical;
-            req.expert      = e;
-            req.kind        = k;
-            req.slot        = slot;
-            req.pinned_buf  = pinned;
-            req.blob_size   = rec.size;
-            req.file_offset = mf.data_offset + rec.rel_offset;
-            req.gpu_dst     = (char *) slot_tensor->data + write_off;
-            // Phase M.2 diagnostic: optionally disable async H2D so the
-            // worker leaves h2d_event=null and the callback falls back to
-            // sync ggml_backend_tensor_set. If this collapses drift, the
-            // async write path (worker → io_h2d_async_timed) is at fault.
-            {
-                static const bool diag_no_async = std::getenv("LLAMA_MOE_DEBUG_NO_ASYNC") != nullptr;
-                req.h2d         = !diag_no_async && (s.compute_backend != nullptr);
-            }
-            req.h2d_event   = nullptr;
-            req.h2d_begin_event = nullptr;
-            req.ssd_read_us = 0;
-
-            miss_lookup[pinned] = miss_meta{ slot_tensor, write_off };
-
-            if (!io_submit(req)) {
-                LLAMA_LOG_ERROR("moe_eval_callback: io_submit failed (queue full) L%d e%d k%d\n",
-                        logical, e, k);
-                GGML_ABORT("MoE-offload: io_submit queue overflow");
-            }
-            ++submitted_misses;
+            miss_blobs.push_back(miss_blob{
+                e,
+                k,
+                slot,
+                slot_tensor,
+                write_off,
+                (size_t) rec.size,
+                mf.data_offset + rec.rel_offset,
+                (char *) slot_tensor->data + write_off,
+            });
         }
 
         // Reserve the slot for this expert immediately so a later miss in the
@@ -1100,33 +1182,39 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 dbg_hits, dbg_misses, dbg_free_alloc, dbg_evictions, s.n_slots);
     }
 
-    int64_t stall_us = 0;
-    // Phase I: per-miss h2d timing events stashed for elapsed-time query at
-    // end_request. Owned by the pending_profile_row we create below.
-    std::vector<std::pair<void *, void *>> h2d_events_for_row;
-    if (submitted_misses > 0) {
-        const auto wait_start = std::chrono::steady_clock::now();
-
-        // Drain the worker: spin until all submitted reads (and their queued
-        // async H2D copies) have been issued.
-        while (io_outstanding() > 0) {
-            std::this_thread::yield();
-        }
+    auto drain_completed = [&]() -> int {
         auto completions = io_drain_completed();
-
+        const int n = (int) completions.size();
         for (auto & c : completions) {
+            if (!c.ok) {
+                LLAMA_LOG_ERROR("moe_eval_callback: I/O failed loading L%d e%d k%d slot=%d "
+                        "offset=%llu bytes=%zu got=%zu errno=%d\n",
+                        c.layer, c.expert, c.kind, c.slot,
+                        (unsigned long long) c.file_offset,
+                        c.blob_size, c.bytes_read, c.io_error);
+                io_release_buffer(c.pinned_buf);
+                miss_lookup.erase(c.pinned_buf);
+                ++completed_misses;
+                GGML_ABORT("MoE-offload: expert blob I/O failed");
+            }
+
             layer_load_stats.ssd_read_us += c.ssd_read_us;
             layer_load_stats.ssd_bytes   += c.blob_size;
             ++layer_load_stats.ssd_reads;
 
             if (c.h2d_event) {
-                // Async path: tell the compute stream to wait on the H2D
-                // end event before consuming the slot weights. Stash both
-                // events (begin, end) so end_request can query their
-                // elapsed time for real h2d_us. They are released back to
-                // the pool at end_request after the query.
+                // Async path: tell the compute stream to wait on the H2D end
+                // event before consuming slot weights. Also synchronize the
+                // event before recycling the pinned staging buffer; otherwise
+                // a later fread could overwrite host memory that CUDA is still
+                // reading.
                 io_compute_wait(s.compute_backend, c.h2d_event);
                 h2d_events_for_row.emplace_back(c.h2d_begin_event, c.h2d_event);
+                const auto h2d_wait_start = std::chrono::steady_clock::now();
+                io_event_sync(c.h2d_event);
+                const auto h2d_wait_end = std::chrono::steady_clock::now();
+                stall_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                        h2d_wait_end - h2d_wait_start).count();
             } else {
                 // Fallback: CUDA unavailable or io_h2d_async failed. Look up
                 // the slot tensor by the pinned-buffer handle and do a sync
@@ -1153,11 +1241,74 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             }
 
             io_release_buffer(c.pinned_buf);
+            miss_lookup.erase(c.pinned_buf);
+            ++completed_misses;
         }
+        return n;
+    };
 
-        const auto wait_end = std::chrono::steady_clock::now();
-        stall_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                wait_end - wait_start).count();
+    if (!miss_blobs.empty()) {
+        static const bool diag_no_async = std::getenv("LLAMA_MOE_DEBUG_NO_ASYNC") != nullptr;
+        size_t next_miss = 0;
+
+        while (next_miss < miss_blobs.size() || completed_misses < submitted_misses) {
+            bool made_progress = false;
+
+            while (next_miss < miss_blobs.size()) {
+                void * pinned = io_try_acquire_buffer();
+                if (!pinned) {
+                    break;
+                }
+
+                const miss_blob & blob = miss_blobs[next_miss];
+                io_request req{};
+                req.layer       = logical;
+                req.expert      = blob.expert;
+                req.kind        = blob.kind;
+                req.slot        = blob.slot;
+                req.pinned_buf  = pinned;
+                req.blob_size   = blob.blob_size;
+                req.file_offset = blob.file_offset;
+                req.gpu_dst     = blob.gpu_dst;
+                req.h2d         = !diag_no_async && (s.compute_backend != nullptr);
+                req.h2d_event   = nullptr;
+                req.h2d_begin_event = nullptr;
+                req.ssd_read_us = 0;
+
+                if (!io_submit(req)) {
+                    io_release_buffer(pinned);
+                    break;
+                }
+
+                miss_lookup[pinned] = miss_meta{ blob.slot_tensor, blob.write_off };
+                ++submitted_misses;
+                ++next_miss;
+                made_progress = true;
+            }
+
+            if (drain_completed() > 0) {
+                made_progress = true;
+            }
+
+            if (!made_progress) {
+                if (io_outstanding() == 0) {
+                    if (drain_completed() > 0) {
+                        continue;
+                    }
+                    LLAMA_LOG_ERROR("moe_eval_callback: no I/O progress while loading misses "
+                            "(submitted=%d completed=%d total=%zu)\n",
+                            submitted_misses, completed_misses, miss_blobs.size());
+                    GGML_ABORT("MoE-offload: async I/O made no progress");
+                }
+
+                const auto wait_start = std::chrono::steady_clock::now();
+                std::this_thread::yield();
+                drain_completed();
+                const auto wait_end = std::chrono::steady_clock::now();
+                stall_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                        wait_end - wait_start).count();
+            }
+        }
     }
 
     if (slot_ids_tensor && slot_ids_tensor->buffer) {
@@ -1218,7 +1369,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             }
         }
 
-        if (s.topk_calls < 8) {
+        if (debug_d4_trace() && s.topk_calls < 8) {
             // Log first few callbacks: buffer name, uniq count, first few entries
             const char * bn = ggml_backend_buffer_name(stt->buffer);
             size_t nz = 0;
@@ -1231,8 +1382,8 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            fprintf(stderr, "[moe-d4] moe_eval_callback: slot_table for layer %d has no buffer (stt=%p)\n",
-                    logical, (void *) stt);
+            LLAMA_LOG_WARN("%s: slot_table for layer %d has no buffer (stt=%p)\n",
+                    __func__, logical, (void *) stt);
         }
     }
     ++s.topk_calls;
@@ -1329,7 +1480,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         s.token_idx += n_tokens > 0 ? (uint64_t) n_tokens : 1;
     }
 
-    if (s.topk_calls % 200 == 0) {
+    if (debug_d4_trace() && s.topk_calls % 200 == 0) {
         fprintf(stderr, "[moe-d4] moe_eval_callback: %llu topk calls, hits=%llu misses=%llu\n",
                 (unsigned long long) s.topk_calls,
                 (unsigned long long) s.cache_hits,
@@ -1349,16 +1500,11 @@ void slot_pool_init_io(const std::string & source_path) {
 
     const manifest & mf = get_manifest();
 
-    // Phase L.2: the buffer pool must accommodate the worst-case per-layer
-    // miss demand WITHOUT requiring an intermediate drain, because the
-    // miss-loop currently submits all misses for a layer before draining
-    // any. Worst case = (kMaxStreamingUbatch * top_k_max) unique experts
-    // per layer, each contributing EXPERT_KIND_COUNT (=3) in-flight
-    // requests. Conservative bound is 8 (ubatch cap) * 8 (typical top_k
-    // upper-bound) * 3 = 192. We also keep at least 2x slot count so the
-    // single-token decode path overlaps freely. Cap at 256 to bound pinned
-    // memory cost (~256 * blob_max bytes).
-    constexpr int kMinIoBuffers = 192;
+    // The eval callback submits misses in chunks and drains completions as
+    // buffers/queue capacity becomes tight, so the pool no longer has to cover
+    // an entire large-ubatch layer miss set. Keep enough buffers for decode and
+    // moderate prefill overlap while bounding pinned memory cost.
+    constexpr int kMinIoBuffers = 32;
     constexpr int kMaxIoBuffers = 256;
     int n_buffers = (int)(2 * n_slots_per_layer());
     if (n_buffers < kMinIoBuffers) n_buffers = kMinIoBuffers;

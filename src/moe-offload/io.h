@@ -50,6 +50,9 @@ struct io_request {
     // cudaEventElapsedTime(begin, h2d_event) for real h2d_us.
     void *   h2d_begin_event;
     int64_t  ssd_read_us;  // worker-measured fread duration in microseconds
+    bool     ok = true;     // false when seek/read failed; caller still owns pinned_buf
+    size_t   bytes_read = 0;
+    int      io_error = 0;
 };
 
 // One-time init.

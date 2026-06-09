@@ -1,7 +1,6 @@
 # MoE Offload Known Issues
 
-Status as of the adaptive ubatch and interactive-mode diagnosis work on
-2026-06-09.
+Status as of the `llama-cli` chat correctness fix on 2026-06-09.
 
 ## Open
 
@@ -29,15 +28,27 @@ Current diagnosis:
 - The Qwen3.5 chat template in this GGUF is Jinja-based. A deterministic
   single-turn test without `--jinja` echoed the question and ended; enabling
   `--jinja` produced an answer containing `Paris`.
-- The MoE offload path still has unconditional `[moe-d4]` `stderr` debug
-  prints, including periodic callback counters. In an interactive terminal
-  these lines interleave with generated tokens and make the visible transcript
-  look corrupted even when they are not model tokens.
+- Default MoE D-3/D-4 traces are now gated behind explicit debug environment
+  variables, so the old terminal interleaving is no longer expected in normal
+  chat runs.
 - This has not yet been proven to be a slot-cache/logit correctness bug. The
   current evidence points first at chat-template invocation and noisy MoE
-  diagnostics in interactive mode.
+  diagnostics in `llama-completion` conversation mode.
 
 Workarounds while this is open:
+
+- For interactive chat, use `llama-cli` with the Jinja chat-template path:
+
+  ```powershell
+  .\build-moe\bin\Release\llama-cli.exe `
+    --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+    --moe-offload `
+    --moe-cache-vram-mb 8000 `
+    --moe-predictor lru `
+    --jinja `
+    --reasoning off `
+    -sys "You are a helpful assistant."
+  ```
 
 - For one-shot factual checks, use raw completion mode:
 
@@ -54,15 +65,50 @@ Workarounds while this is open:
 
 - For chat mode with this model, prefer `--jinja` and use `-sys` for system
   instructions instead of seeding the session with `-p "Hello"`.
-- Redirect `stderr` when checking answer text, because current `[moe-d4]`
-  diagnostics are not quiet enough for interactive use.
 
 Next fix:
 
-- Gate or remove the unconditional `[moe-d4]` prints.
-- Add a chat-template smoke test for `llama-completion -cnv --jinja -st`.
+- Keep `llama-completion` scoped to raw completion and logit diagnostics unless
+  its conversation-mode behavior is intentionally revisited.
 - Re-run a golden-logit check on the formatted chat prompt before treating this
   as fully closed.
+
+### Batched Streaming Prefill Can Corrupt Chat Logits
+
+`llama-cli --moe-offload` produced wrong visible answers for simple prompts
+such as `who are you?`, `what is the capital of France?`, and `what is 1 + 1?`
+when streaming prefill used multi-token ubatches. The same model answered
+cleanly without MoE offload, and `LLAMA_MOE_STREAMING_UBATCH=1` made the
+offloaded path answer cleanly.
+
+Current diagnosis:
+
+- This is a MoE streaming prefill correctness issue, not a Qwen model issue.
+- `LLAMA_MOE_STREAMING_UBATCH=1` is clean on the tested prompts.
+- `LLAMA_MOE_STREAMING_UBATCH=4` can leak extra `</think>` text.
+- `LLAMA_MOE_STREAMING_UBATCH=8` can stream reasoning text instead of the final
+  answer.
+- Async H2D was not the cause; `LLAMA_MOE_DEBUG_NO_ASYNC=1` did not fix it.
+- Forced no-hit reloads, identity slot-table fill, and compute sync diagnostics
+  did not fix it.
+
+Mitigation:
+
+- `llama-cli --moe-offload` now requests `n_ubatch=1` by default unless
+  `LLAMA_MOE_STREAMING_UBATCH` is explicitly set.
+- Bench and diagnostic tools can still force larger streaming ubatches to
+  continue investigating the batched slot path.
+
+### `llama-cli` Reasoning-Budget Chat Output
+
+During the 2026-06-09 chat smoke, `llama-cli` with:
+
+```text
+--reasoning-budget 0
+```
+
+could still display reasoning text instead of concise final answers for this
+Qwen3.5 GGUF. The supported chat invocation now uses `--reasoning off`.
 
 ### Streaming Capacity Diagnostics
 
@@ -136,6 +182,12 @@ The following remain outside MVP scope:
   per layer without reserving the minimum working set.
 
 ## Closed
+
+### Default D-3/D-4 Trace Spam
+
+The old slot-pool `[moe-d3]` and `[moe-d4]` diagnostic prints are quiet by
+default. Set `LLAMA_MOE_DEBUG_D4=1`, `LLAMA_MOE_DEBUG_LOADS=1`, or
+`LLAMA_MOE_DEBUG_TRACE=1` to recover the detailed tensor/load traces.
 
 ### Fixed Streaming UBatch Cap
 

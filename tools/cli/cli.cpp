@@ -59,6 +59,7 @@ struct cli_context {
     std::vector<raw_buffer> input_files;
     task_params defaults;
     bool verbose_prompt;
+    common_reasoning_format reasoning_format;
 
     // thread for showing "loading" animation
     std::atomic<bool> loading_show;
@@ -75,6 +76,7 @@ struct cli_context {
         // defaults.return_progress = true; // TODO: show progress
 
         verbose_prompt = params.verbose_prompt;
+        reasoning_format = params.reasoning_format;
     }
 
     std::string generate_completion(result_timings & out_timings) {
@@ -92,7 +94,7 @@ struct cli_context {
 
             // chat template settings
             task.params.chat_parser_params = common_chat_parser_params(chat_params);
-            task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            task.params.chat_parser_params.reasoning_format = reasoning_format;
             if (!chat_params.parser.empty()) {
                 task.params.chat_parser_params.parser.load(chat_params.parser);
             }
@@ -214,7 +216,7 @@ struct cli_context {
         inputs.use_jinja             = chat_params.use_jinja;
         inputs.parallel_tool_calls   = caps["supports_parallel_tool_calls"];
         inputs.add_generation_prompt = true;
-        inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+        inputs.reasoning_format      = reasoning_format;
         inputs.force_pure_content    = chat_params.force_pure_content;
         inputs.enable_thinking       = chat_params.enable_thinking ? common_chat_templates_support_enable_thinking(chat_params.tmpls.get()) : false;
 
@@ -355,6 +357,16 @@ int llama_cli(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
     }
+
+#ifdef LLAMA_MOE_OFFLOAD
+    if (params.moe_offload && std::getenv("LLAMA_MOE_STREAMING_UBATCH") == nullptr) {
+        // The current streaming slot path is correct for decode/single-token
+        // prefill, but batched chat prefill can corrupt Qwen MoE responses.
+        // Keep interactive chat correctness-first by default; diagnostics can
+        // still force a larger value via LLAMA_MOE_STREAMING_UBATCH=N.
+        params.n_ubatch = 1;
+    }
+#endif
 
     // TODO: maybe support it later?
     if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED) {

@@ -7,6 +7,7 @@ This fork adds a guarded MoE offload overlay behind `LLAMA_MOE_OFFLOAD`. The def
 ```bash
 cmake -B build-moe -DLLAMA_MOE_OFFLOAD=ON -DGGML_CUDA=ON
 cmake --build build-moe --config Release --target llama-moe-bench llama-completion llama-moe-repack
+cmake --build build-moe\tools\cli --config Release --target llama-cli
 ```
 
 ## Repack
@@ -20,7 +21,41 @@ cmake --build build-moe --config Release --target llama-moe-bench llama-completi
 
 The current repacker writes a stock-loadable GGUF with page-aligned tensor data and `moe_offload.*` metadata. It records the layout as `fused-tensors-page-aligned-v1`: the original fused expert tensors remain in the file, and `moe_offload.expert_blob.table` records each `(logical_layer, expert, kind)` byte range relative to the GGUF data section.
 
-## Run
+## Chat with `llama-cli`
+
+Use `llama-cli` as the supported interactive chat frontend for MoE-offloaded
+models:
+
+```powershell
+.\build-moe\bin\Release\llama-cli.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --moe-offload `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor lru `
+  --jinja `
+  --reasoning off `
+  -sys "You are a helpful assistant."
+```
+
+For this Qwen3.5 GGUF, keep `--jinja` enabled and use `-sys` for system
+instructions. Use `--reasoning off` for normal chat; `--reasoning-budget 0`
+can still stream reasoning text for this model and is not the recommended chat
+setting.
+
+`llama-cli --moe-offload` defaults to correctness-first `n_ubatch=1` because
+the current batched streaming prefill path can corrupt Qwen MoE chat logits.
+Set `LLAMA_MOE_STREAMING_UBATCH=N` only for diagnostics while the batched path
+remains under investigation.
+
+Use `llama-completion -no-cnv` for raw completion and logit diagnostics. Avoid
+using `-p "Hello"` as a system prompt in conversation mode; it seeds the
+conversation as user-visible text.
+
+Default D-3/D-4 slot-pool traces are quiet in chat. Set
+`LLAMA_MOE_DEBUG_D4=1`, `LLAMA_MOE_DEBUG_LOADS=1`, or
+`LLAMA_MOE_DEBUG_TRACE=1` when those diagnostics are needed.
+
+## Raw Completion
 
 ```powershell
 .\build-moe\bin\Release\llama-completion.exe `
@@ -239,6 +274,10 @@ registered with CTest because they need the multi-GB model):
 - `test-golden-logits.ps1` — Phase J streaming-vs-full-residency logit
   comparison gate.
 - `compare_logits.py` — binary-dump comparator used by the harness.
+
+- `test-llama-cli-chat.ps1` - `llama-cli --moe-offload --jinja`
+  chat smoke; asserts identity, France, and arithmetic answers are coherent
+  and default D-3/D-4 traces are quiet.
 
 See [`tests/moe-offload/README.md`](../../tests/moe-offload/README.md)
 for runtime prereqs and invocation details.
