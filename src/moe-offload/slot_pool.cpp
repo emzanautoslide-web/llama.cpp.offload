@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <list>
 #include <mutex>
 #include <string>
@@ -109,6 +110,7 @@ struct slot_pool_state {
     };
     std::vector<pending_profile_row> pending_rows;
     int last_pending_idx = -1;
+    std::string current_request_phase = "unknown";
 };
 
 slot_pool_state & state() {
@@ -262,6 +264,23 @@ void reset_slot_pool() {
     s.slot_table_host.clear();
     s.io_scratch.clear();
     if (s.io_fp) { fclose(s.io_fp); s.io_fp = nullptr; }
+}
+
+void slot_pool_reset_cache() {
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    for (auto & lc : s.cache) {
+        std::fill(lc.slot_to_expert.begin(), lc.slot_to_expert.end(), -1);
+        lc.exp2slot.clear();
+        lc.lru.clear();
+        lc.lru_it.clear();
+        lc.fingerprints.clear();
+    }
+    s.cache_hits = 0;
+    s.cache_misses = 0;
+    s.topk_calls = 0;
+    s.token_idx = 0;
+    s.current_token_idx = 0;
 }
 
 uint32_t n_slots_per_layer() {
@@ -826,6 +845,7 @@ void lru_touch(slot_pool_state::layer_cache & lc, int32_t expert) {
 } // namespace
 
 bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    const auto callback_start = std::chrono::steady_clock::now();
     (void) user_data;
     if (!t || !t->name[0]) {
         return true;
@@ -921,7 +941,10 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     const int64_t n_elem = ggml_nelements(t);
     const int64_t n_tokens = t->ne[1];
     std::vector<int32_t> ids((size_t) n_elem);
+    const auto topk_d2h_start = std::chrono::steady_clock::now();
     ggml_backend_tensor_get(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+    const auto topk_d2h_end = std::chrono::steady_clock::now();
+    const int64_t topk_d2h_us = elapsed_us(topk_d2h_start, topk_d2h_end);
 
     const char * phase = n_tokens > 1 ? "prefill" : "decode";
     if (logical == 0) {
@@ -936,7 +959,8 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         if (e >= 0 && (uint32_t) e < mf.n_experts_per_layer) uniq.insert(e);
     }
 
-    int64_t pred_us = 0;
+    int64_t pred_observe_us = 0;
+    int64_t pred_score_us = 0;
 
     // Phase E-3: observe expert usage for predictor.
     {
@@ -944,7 +968,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         const auto pred_start = std::chrono::steady_clock::now();
         s.pred->observe(logical, obs);
         const auto pred_end = std::chrono::steady_clock::now();
-        pred_us += elapsed_us(pred_start, pred_end);
+        pred_observe_us += elapsed_us(pred_start, pred_end);
     }
 
     // Architectural constraint: all unique experts selected this batch must fit
@@ -1105,7 +1129,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 if (sc < best_score) { best_score = sc; best_victim = exp; }
             }
             const auto pred_end = std::chrono::steady_clock::now();
-            pred_us += elapsed_us(pred_start, pred_end);
+            pred_score_us += elapsed_us(pred_start, pred_end);
             if (best_victim < 0) {
                 // Fall back to LRU tail, but still skip reserved-this-call.
                 for (auto it = lc.lru.rbegin(); it != lc.lru.rend(); ++it) {
@@ -1311,6 +1335,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
+    int64_t slot_ids_h2d_us = 0;
     if (slot_ids_tensor && slot_ids_tensor->buffer) {
         std::vector<int32_t> slot_ids_host(ids.size(), 0);
         for (size_t i = 0; i < ids.size(); ++i) {
@@ -1323,8 +1348,11 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             }
             slot_ids_host[i] = it->second;
         }
+        const auto slot_ids_h2d_start = std::chrono::steady_clock::now();
         set_tensor_for_compute(s, slot_ids_tensor, slot_ids_host.data(), 0,
                                slot_ids_host.size() * sizeof(int32_t));
+        const auto slot_ids_h2d_end = std::chrono::steady_clock::now();
+        slot_ids_h2d_us = elapsed_us(slot_ids_h2d_start, slot_ids_h2d_end);
     }
 
     // Strategy (D-4): build slot_table host buffer (init 0, set hot entries).
@@ -1353,9 +1381,13 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     // as the slot weight tensors, so its storage is never aliased by the
     // scheduler's temporaries — the immediately-following `ggml_get_rows`
     // consumer will read what we just wrote.
+    int64_t slot_table_h2d_us = 0;
     if (stt && stt->buffer) {
+        const auto slot_table_h2d_start = std::chrono::steady_clock::now();
         set_tensor_for_compute(s, stt, s.slot_table_host.data(), 0,
                                s.slot_table_host.size() * sizeof(int32_t));
+        const auto slot_table_h2d_end = std::chrono::steady_clock::now();
+        slot_table_h2d_us = elapsed_us(slot_table_h2d_start, slot_table_h2d_end);
 
         // Phase M.2 diagnostic: force a full compute-stream drain after the
         // slot_table write. If this collapses streaming drift to ~0, the bug
@@ -1395,6 +1427,10 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         int k_req = (int) uniq.size();
         slot_pool_state::pending_profile_row p;
         p.logical = logical;
+        const profile_request_row request_row = current_profile_request_row();
+        p.row.request_idx = request_row.request_idx;
+        p.row.repeat_idx = request_row.repeat_idx;
+        p.row.batch_idx = request_row.batch_idx;
         p.row.token_idx = row_token_idx;
         p.row.phase = phase;
         p.row.layer = logical;
@@ -1410,7 +1446,12 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         // Phase H: stall_us is the host-measured wall-clock around the
         // io_compute_wait drain.
         p.row.stall_us = stall_us;
-        p.row.pred_us = pred_us;
+        p.row.pred_observe_us = pred_observe_us;
+        p.row.pred_score_us = pred_score_us;
+        p.row.pred_us = pred_observe_us + pred_score_us;
+        p.row.topk_d2h_us = topk_d2h_us;
+        p.row.slot_ids_h2d_us = slot_ids_h2d_us;
+        p.row.slot_table_h2d_us = slot_table_h2d_us;
         p.row.ssd_bytes = layer_load_stats.ssd_bytes;
         p.row.ssd_reads = layer_load_stats.ssd_reads;
         p.row.cache_resident_experts = (int) lc.exp2slot.size();
@@ -1432,6 +1473,11 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
         s.pending_rows.push_back(std::move(p));
         s.last_pending_idx = (int) s.pending_rows.size() - 1;
+    }
+
+    if (s.last_pending_idx >= 0 && (size_t) s.last_pending_idx < s.pending_rows.size()) {
+        const auto callback_end = std::chrono::steady_clock::now();
+        s.pending_rows[(size_t) s.last_pending_idx].row.callback_wall_us = elapsed_us(callback_start, callback_end);
     }
 
     // Phase M.6 diagnostic: content-hash slots after the callback has finished
@@ -1534,6 +1580,7 @@ void slot_pool_set_compute_backend(ggml_backend_t backend) {
 }
 
 void slot_pool_end_request() {
+    const auto end_request_start = std::chrono::steady_clock::now();
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
 
@@ -1557,7 +1604,13 @@ void slot_pool_end_request() {
     // and h2d intervals, patch into the row, hand off to the profiler,
     // then release all events back to the pool.
     profiler * prof = get_profiler();
+    int64_t profile_flush_us = 0;
     for (auto & p : s.pending_rows) {
+        if (s.current_request_phase == "unknown") {
+            s.current_request_phase = p.row.phase;
+        } else if (s.current_request_phase != p.row.phase) {
+            s.current_request_phase = "mixed";
+        }
         int64_t compute_us = 0;
         if (p.compute_begin_event && p.compute_end_event) {
             int64_t us = io_event_elapsed_us(p.compute_begin_event, p.compute_end_event);
@@ -1588,13 +1641,39 @@ void slot_pool_end_request() {
     s.pending_rows.clear();
     s.last_pending_idx = -1;
 
+    int64_t predictor_end_us = 0;
+    int64_t predictor_save_us = 0;
+    uint64_t sidecar_write_bytes = 0;
     if (s.pred) {
+        const auto pred_end_start = std::chrono::steady_clock::now();
         s.pred->end_request();
+        const auto pred_end_done = std::chrono::steady_clock::now();
+        predictor_end_us = elapsed_us(pred_end_start, pred_end_done);
         const runtime_options & opts = get_options();
         if (std::strcmp(s.pred->name(), "eamc") == 0 && !opts.eamc_path.empty()) {
+            const auto save_start = std::chrono::steady_clock::now();
             s.pred->save(opts.eamc_path);
+            const auto save_done = std::chrono::steady_clock::now();
+            predictor_save_us = elapsed_us(save_start, save_done);
+            std::ifstream in(opts.eamc_path, std::ios::binary | std::ios::ate);
+            if (in) {
+                const std::streamoff size = in.tellg();
+                if (size > 0) {
+                    sidecar_write_bytes = (uint64_t) size;
+                }
+            }
         }
     }
+    if (prof) {
+        const auto flush_start = std::chrono::steady_clock::now();
+        prof->flush();
+        const auto flush_done = std::chrono::steady_clock::now();
+        profile_flush_us = elapsed_us(flush_start, flush_done);
+    }
+
+    (void) end_request_start;
+    add_current_request_timing(s.current_request_phase.c_str(), predictor_end_us, predictor_save_us, profile_flush_us, sidecar_write_bytes);
+    s.current_request_phase = "unknown";
 }
 
 } // namespace llama_moe

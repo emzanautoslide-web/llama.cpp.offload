@@ -32,11 +32,17 @@ const manifest &        get_manifest();
 void begin_request();
 void end_request();
 
+LLAMA_API void set_profile_request_context(int repeat_idx, int batch_idx, const char * phase);
+uint64_t current_request_idx();
+profile_request_row current_profile_request_row();
+void add_current_request_timing(const char * observed_phase, int64_t predictor_end_us, int64_t predictor_save_us, int64_t profile_flush_us, uint64_t sidecar_write_bytes);
+
 // Phase E: access the global profiler for recording per-layer rows from
 // the eval-callback. Returns nullptr if profiling is not enabled.
 profiler * get_profiler();
 
 LLAMA_API profile_snapshot get_profile_snapshot();
+LLAMA_API void reset_profile();
 
 ggml_tensor * remap_selected_experts(
         ggml_context * ctx,

@@ -47,6 +47,16 @@ bool profiler::open(const std::string & csv_path) {
     return true;
 }
 
+void profiler::reset(const std::string & csv_path) {
+    flush();
+    if (csv.is_open()) {
+        csv.close();
+    }
+    prefill_stats = {};
+    decode_stats = {};
+    open(csv_path);
+}
+
 void profiler::record(const profile_row & row) {
     profile_phase_stats & stats = row.phase == "prefill" ? prefill_stats : decode_stats;
     ++stats.rows;
@@ -60,12 +70,22 @@ void profiler::record(const profile_row & row) {
     stats.compute_us += row.compute_us;
     stats.stall_us += row.stall_us;
     stats.pred_us += row.pred_us;
+    stats.pred_observe_us += row.pred_observe_us;
+    stats.pred_score_us += row.pred_score_us;
+    stats.callback_wall_us += row.callback_wall_us;
+    stats.topk_d2h_us += row.topk_d2h_us;
+    stats.slot_ids_h2d_us += row.slot_ids_h2d_us;
+    stats.slot_table_h2d_us += row.slot_table_h2d_us;
     if (row.cache_resident_experts > stats.cache_resident_peak) {
         stats.cache_resident_peak = row.cache_resident_experts;
     }
 
     if (csv.is_open()) {
-        csv << row.token_idx << ','
+        csv << "layer" << ','
+            << row.request_idx << ','
+            << row.repeat_idx << ','
+            << row.batch_idx << ','
+            << row.token_idx << ','
             << row.phase << ','
             << row.layer << ','
             << row.k_required << ','
@@ -76,8 +96,63 @@ void profiler::record(const profile_row & row) {
             << row.compute_us << ','
             << row.stall_us << ','
             << row.pred_us << ','
+            << row.pred_observe_us << ','
+            << row.pred_score_us << ','
+            << row.callback_wall_us << ','
+            << row.topk_d2h_us << ','
+            << row.slot_ids_h2d_us << ','
+            << row.slot_table_h2d_us << ','
             << row.cache_resident_experts << ','
-            << row.predictor << '\n';
+            << row.predictor << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << '\n';
+    }
+}
+
+void profiler::record_request(const profile_request_row & row) {
+    profile_phase_stats & stats = row.phase == "prefill" ? prefill_stats : decode_stats;
+    ++stats.requests;
+    stats.request_wall_us += row.request_wall_us;
+    stats.request_end_us += row.request_end_us;
+    stats.predictor_end_us += row.predictor_end_us;
+    stats.predictor_save_us += row.predictor_save_us;
+    stats.profile_flush_us += row.profile_flush_us;
+    stats.sidecar_write_bytes += row.sidecar_write_bytes;
+
+    if (csv.is_open()) {
+        csv << "request" << ','
+            << row.request_idx << ','
+            << row.repeat_idx << ','
+            << row.batch_idx << ','
+            << 0 << ','
+            << row.phase << ','
+            << -1 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << "" << ','
+            << row.request_wall_us << ','
+            << row.request_end_us << ','
+            << row.predictor_end_us << ','
+            << row.predictor_save_us << ','
+            << row.profile_flush_us << ','
+            << row.sidecar_write_bytes << '\n';
     }
 }
 
@@ -113,6 +188,18 @@ std::string profiler::summary() const {
     out << "compute_us: " << stats.compute_us << '\n';
     out << "stall_us: " << stats.stall_us << '\n';
     out << "pred_us: " << stats.pred_us << '\n';
+    out << "pred_observe_us: " << stats.pred_observe_us << '\n';
+    out << "pred_score_us: " << stats.pred_score_us << '\n';
+    out << "callback_wall_us: " << stats.callback_wall_us << '\n';
+    out << "topk_d2h_us: " << stats.topk_d2h_us << '\n';
+    out << "slot_ids_h2d_us: " << stats.slot_ids_h2d_us << '\n';
+    out << "slot_table_h2d_us: " << stats.slot_table_h2d_us << '\n';
+    out << "request_wall_us: " << stats.request_wall_us << '\n';
+    out << "request_end_us: " << stats.request_end_us << '\n';
+    out << "predictor_end_us: " << stats.predictor_end_us << '\n';
+    out << "predictor_save_us: " << stats.predictor_save_us << '\n';
+    out << "profile_flush_us: " << stats.profile_flush_us << '\n';
+    out << "sidecar_write_bytes: " << stats.sidecar_write_bytes << '\n';
     return out.str();
 }
 
@@ -133,6 +220,15 @@ std::string format_summary(
     const double expert_cache_gib = (double) ctx.cache_mb / 1024.0;
     const double vram_peak_gib = bytes_to_gib(ctx.vram_peak_bytes);
     const double vram_other_gib = std::max(0.0, vram_peak_gib - expert_cache_gib);
+    const int64_t profiled_decode_us =
+        profile.decode.ssd_read_us +
+        profile.decode.h2d_us +
+        profile.decode.compute_us +
+        profile.decode.stall_us +
+        profile.decode.pred_us +
+        profile.decode.request_end_us;
+    const int64_t wall_decode_us = (int64_t) (ctx.tpot_ms * 1000.0 * (double) ctx.n_gen * (double) ctx.n_repeat);
+    const int64_t unattributed_decode_us = wall_decode_us - profiled_decode_us;
 
     std::ostringstream out;
     out << std::fixed << std::setprecision(2);
@@ -149,6 +245,12 @@ std::string format_summary(
                 << "  mode=" << (ctx.streaming ? "streaming" : "full-residency");
         }
         out << "\n\n";
+    }
+    if (ctx.cache_reset_between_repeats || ctx.warm_cache) {
+        out << "calibration: "
+            << "cache_reset_between_repeats=" << (ctx.cache_reset_between_repeats ? "true" : "false")
+            << "  warm_cache=" << (ctx.warm_cache ? "true" : "false")
+            << "\n\n";
     }
 
     out << "phase     tokens   total_ms   per_token_ms   tok/s\n";
@@ -183,6 +285,36 @@ std::string format_summary(
     out << "  predictor      " << std::setw(8)
         << us_per_token_ms(profile.decode.pred_us, ctx.n_gen, ctx.n_repeat) << " ms\n\n";
 
+    out << "Profiler breakdown (decode, mean per token):\n";
+    out << "  predictor_observe " << std::setw(8)
+        << us_per_token_ms(profile.decode.pred_observe_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  predictor_score   " << std::setw(8)
+        << us_per_token_ms(profile.decode.pred_score_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  callback_wall     " << std::setw(8)
+        << us_per_token_ms(profile.decode.callback_wall_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  topk_d2h          " << std::setw(8)
+        << us_per_token_ms(profile.decode.topk_d2h_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  slot_ids_h2d      " << std::setw(8)
+        << us_per_token_ms(profile.decode.slot_ids_h2d_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  slot_table_h2d    " << std::setw(8)
+        << us_per_token_ms(profile.decode.slot_table_h2d_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  request_end       " << std::setw(8)
+        << us_per_token_ms(profile.decode.request_end_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  predictor_end     " << std::setw(8)
+        << us_per_token_ms(profile.decode.predictor_end_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  predictor_save    " << std::setw(8)
+        << us_per_token_ms(profile.decode.predictor_save_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  profile_flush     " << std::setw(8)
+        << us_per_token_ms(profile.decode.profile_flush_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  sidecar_written   " << std::setw(8)
+        << bytes_to_mib((double) profile.decode.sidecar_write_bytes / (double) decode_tokens_total)
+        << " MB/token\n\n";
+
+    out << "Wall/profile reconciliation (decode):\n";
+    out << "  wall_decode_us        " << wall_decode_us << '\n';
+    out << "  profiled_decode_us    " << profiled_decode_us << '\n';
+    out << "  unattributed_decode_us " << unattributed_decode_us << "\n\n";
+
     out << "VRAM peak: " << std::setprecision(2) << vram_peak_gib << " GB";
     if (ctx.vram_total_bytes > 0) {
         out << " / " << bytes_to_gib(ctx.vram_total_bytes) << " GB";
@@ -209,6 +341,19 @@ profile_phase_stats profiler::total() const {
     stats.compute_us = prefill_stats.compute_us + decode_stats.compute_us;
     stats.stall_us = prefill_stats.stall_us + decode_stats.stall_us;
     stats.pred_us = prefill_stats.pred_us + decode_stats.pred_us;
+    stats.pred_observe_us = prefill_stats.pred_observe_us + decode_stats.pred_observe_us;
+    stats.pred_score_us = prefill_stats.pred_score_us + decode_stats.pred_score_us;
+    stats.callback_wall_us = prefill_stats.callback_wall_us + decode_stats.callback_wall_us;
+    stats.topk_d2h_us = prefill_stats.topk_d2h_us + decode_stats.topk_d2h_us;
+    stats.slot_ids_h2d_us = prefill_stats.slot_ids_h2d_us + decode_stats.slot_ids_h2d_us;
+    stats.slot_table_h2d_us = prefill_stats.slot_table_h2d_us + decode_stats.slot_table_h2d_us;
+    stats.request_wall_us = prefill_stats.request_wall_us + decode_stats.request_wall_us;
+    stats.request_end_us = prefill_stats.request_end_us + decode_stats.request_end_us;
+    stats.predictor_end_us = prefill_stats.predictor_end_us + decode_stats.predictor_end_us;
+    stats.predictor_save_us = prefill_stats.predictor_save_us + decode_stats.predictor_save_us;
+    stats.profile_flush_us = prefill_stats.profile_flush_us + decode_stats.profile_flush_us;
+    stats.sidecar_write_bytes = prefill_stats.sidecar_write_bytes + decode_stats.sidecar_write_bytes;
+    stats.requests = prefill_stats.requests + decode_stats.requests;
     stats.cache_resident_peak = prefill_stats.cache_resident_peak > decode_stats.cache_resident_peak
         ? prefill_stats.cache_resident_peak
         : decode_stats.cache_resident_peak;
@@ -216,7 +361,7 @@ profile_phase_stats profiler::total() const {
 }
 
 void profiler::write_header() {
-    csv << "token_idx,phase,layer,k_required,k_hit,k_miss,ssd_read_us,h2d_us,compute_us,stall_us,pred_us,cache_resident_experts,predictor\n";
+    csv << "row_type,request_idx,repeat_idx,batch_idx,token_idx,phase,layer,k_required,k_hit,k_miss,ssd_read_us,h2d_us,compute_us,stall_us,pred_us,pred_observe_us,pred_score_us,callback_wall_us,topk_d2h_us,slot_ids_h2d_us,slot_table_h2d_us,cache_resident_experts,predictor,request_wall_us,request_end_us,predictor_end_us,predictor_save_us,profile_flush_us,sidecar_write_bytes\n";
 }
 
 } // namespace llama_moe

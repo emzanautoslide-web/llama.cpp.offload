@@ -47,6 +47,8 @@ struct bench_params {
     int n_gpu_layers = 99;
     int n_ctx = 4096;
     int n_ubatch = 0;
+    bool moe_reset_cache_between_repeats = false;
+    bool moe_warm_cache = false;
 };
 
 static bool parse_args(int argc, char ** argv, bench_params & p) {
@@ -87,6 +89,8 @@ static bool parse_args(int argc, char ** argv, bench_params & p) {
         else if (int_for("-ub", p.n_ubatch)) {}
         else if (int_for("--ubatch", p.n_ubatch)) {}
         else if (int_for("--ubatch-size", p.n_ubatch)) {}
+        else if (arg == "--moe-reset-cache-between-repeats") { p.moe_reset_cache_between_repeats = true; }
+        else if (arg == "--moe-warm-cache") { p.moe_warm_cache = true; }
         else if (value_for("-p", p.prompt)) {}
     }
     if (p.n_repeat < 1) p.n_repeat = 1;
@@ -267,7 +271,7 @@ static llama_token greedy_token(llama_context * ctx, int vocab_size) {
 int main(int argc, char ** argv) {
     bench_params p;
     if (!parse_args(argc, argv, p)) {
-        fprintf(stderr, "Usage: llama-moe-bench --model <path> --pp N --tg N [--repeat N] [--moe-cache-vram-mb MB] [--moe-predictor lru|eamc] [--moe-eamc-path PATH] [--moe-profile-csv PATH] [--moe-profile-summary PATH] [-ub N]\n");
+        fprintf(stderr, "Usage: llama-moe-bench --model <path> --pp N --tg N [--repeat N] [--moe-cache-vram-mb MB] [--moe-predictor lru|eamc] [--moe-eamc-path PATH] [--moe-profile-csv PATH] [--moe-profile-summary PATH] [--moe-reset-cache-between-repeats] [--moe-warm-cache] [-ub N]\n");
         return 1;
     }
 
@@ -380,6 +384,8 @@ int main(int argc, char ** argv) {
         summary_ctx.n_slots = llama_moe::n_slots_per_layer();
         summary_ctx.n_experts = llama_moe::n_experts_per_layer();
         summary_ctx.streaming = llama_moe::streaming_mode();
+        summary_ctx.cache_reset_between_repeats = p.moe_reset_cache_between_repeats;
+        summary_ctx.warm_cache = p.moe_warm_cache;
         summary_ctx.ttft_ms = average_or_zero(ttft_ms);
         summary_ctx.tpot_ms = average_or_zero(tpot_ms);
         summary_ctx.total_ms = total_ms.empty() ? summary_ctx.ttft_ms : average_or_zero(total_ms);
@@ -415,11 +421,30 @@ int main(int argc, char ** argv) {
         return profile;
     };
 
+    if (p.moe_warm_cache) {
+        fprintf(stderr, "[moe-bench] warming MoE cache before measured repeats\n");
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_moe::set_profile_request_context(-1, -1, "warmup");
+        llama_batch warm_batch = llama_batch_get_one(prompt_tokens.data(), n_prompt_tokens);
+        if (llama_decode(ctx, warm_batch) != 0) {
+            fprintf(stderr, "warm-cache prefill decode failed\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        llama_moe::reset_profile();
+    }
+
     for (int rep = 0; rep < p.n_repeat; ++rep) {
         llama_memory_clear(llama_get_memory(ctx), true);
+        if (p.moe_reset_cache_between_repeats) {
+            llama_moe::slot_pool_reset_cache();
+        }
         llama_perf_context_reset(ctx);
 
         const double t0 = now_ms();
+        llama_moe::set_profile_request_context(rep, 0, "prefill");
         llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt_tokens);
         if (llama_decode(ctx, batch) != 0) {
             fprintf(stderr, "prefill decode failed (rep %d)\n", rep);
@@ -433,6 +458,7 @@ int main(int argc, char ** argv) {
         llama_token token = greedy_token(ctx, vocab_size);
         for (int gen = 0; gen < p.n_gen; ++gen) {
             batch = llama_batch_get_one(&token, 1);
+            llama_moe::set_profile_request_context(rep, gen + 1, "decode");
             if (llama_decode(ctx, batch) != 0) {
                 fprintf(stderr, "decode failed at gen %d (rep %d)\n", gen, rep);
                 exit_code = 1;

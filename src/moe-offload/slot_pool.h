@@ -22,6 +22,10 @@ void configure_slot_pool();
 // the loader's ctx_map and outlive this reset.
 void reset_slot_pool();
 
+// Reset only streaming cache residency and counters. Slot tensors and graph
+// registrations remain intact. Intended for benchmark calibration.
+LLAMA_API void slot_pool_reset_cache();
+
 // Returns the uniform slot count per MoE layer.
 LLAMA_API uint32_t n_slots_per_layer();
 
