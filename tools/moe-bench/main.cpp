@@ -477,6 +477,11 @@ int main(int argc, char ** argv) {
         write_summary(false);
     }
 
+    if (!llama_moe::flush_predictor()) {
+        fprintf(stderr, "[moe-bench] ERROR: failed to flush MoE predictor state\n");
+        exit_code = 1;
+    }
+
     fprintf(stderr, "[moe-bench] computing summary...\n");
     const llama_moe::profile_snapshot profile = write_summary(true);
     if (profile.prefill.rows + profile.decode.rows == 0) {

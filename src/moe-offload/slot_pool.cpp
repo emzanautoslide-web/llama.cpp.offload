@@ -88,6 +88,7 @@ struct slot_pool_state {
 
     // Phase E: predictor
     std::unique_ptr<predictor> pred;
+    bool pred_dirty = false;
     uint64_t token_idx = 0;
     uint64_t current_token_idx = 0;
 
@@ -232,6 +233,7 @@ void configure_slot_pool() {
 
     s.pending_rows.clear();
     s.last_pending_idx = -1;
+    s.pred_dirty = false;
 
     // Phase E: init predictor from runtime options
     const runtime_options & opts = get_options();
@@ -264,6 +266,8 @@ void reset_slot_pool() {
     s.slot_table_host.clear();
     s.io_scratch.clear();
     if (s.io_fp) { fclose(s.io_fp); s.io_fp = nullptr; }
+    s.pred.reset();
+    s.pred_dirty = false;
 }
 
 void slot_pool_reset_cache() {
@@ -1579,6 +1583,15 @@ void slot_pool_set_compute_backend(ggml_backend_t backend) {
             backend ? ggml_backend_name(backend) : "<none>");
 }
 
+void slot_pool_begin_request() {
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.current_request_phase = "unknown";
+    if (s.pred) {
+        s.pred->begin_request();
+    }
+}
+
 void slot_pool_end_request() {
     const auto end_request_start = std::chrono::steady_clock::now();
     auto & s = state();
@@ -1649,19 +1662,8 @@ void slot_pool_end_request() {
         s.pred->end_request();
         const auto pred_end_done = std::chrono::steady_clock::now();
         predictor_end_us = elapsed_us(pred_end_start, pred_end_done);
-        const runtime_options & opts = get_options();
-        if (std::strcmp(s.pred->name(), "eamc") == 0 && !opts.eamc_path.empty()) {
-            const auto save_start = std::chrono::steady_clock::now();
-            s.pred->save(opts.eamc_path);
-            const auto save_done = std::chrono::steady_clock::now();
-            predictor_save_us = elapsed_us(save_start, save_done);
-            std::ifstream in(opts.eamc_path, std::ios::binary | std::ios::ate);
-            if (in) {
-                const std::streamoff size = in.tellg();
-                if (size > 0) {
-                    sidecar_write_bytes = (uint64_t) size;
-                }
-            }
+        if (std::strcmp(s.pred->name(), "eamc") == 0) {
+            s.pred_dirty = true;
         }
     }
     if (prof) {
@@ -1674,6 +1676,34 @@ void slot_pool_end_request() {
     (void) end_request_start;
     add_current_request_timing(s.current_request_phase.c_str(), predictor_end_us, predictor_save_us, profile_flush_us, sidecar_write_bytes);
     s.current_request_phase = "unknown";
+}
+
+bool slot_pool_flush_predictor() {
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.pred || std::strcmp(s.pred->name(), "eamc") != 0) {
+        return true;
+    }
+
+    const runtime_options & opts = get_options();
+    if (opts.eamc_path.empty() || !s.pred_dirty) {
+        return true;
+    }
+
+    const bool ok = s.pred->save(opts.eamc_path);
+    if (ok) {
+        s.pred_dirty = false;
+        std::ifstream in(opts.eamc_path, std::ios::binary | std::ios::ate);
+        if (in) {
+            const std::streamoff size = in.tellg();
+            LLAMA_LOG_INFO("%s: saved EAMC sidecar: %s (%lld bytes)\n",
+                    __func__, opts.eamc_path.c_str(), (long long) size);
+        } else {
+            LLAMA_LOG_INFO("%s: saved EAMC sidecar: %s\n",
+                    __func__, opts.eamc_path.c_str());
+        }
+    }
+    return ok;
 }
 
 } // namespace llama_moe

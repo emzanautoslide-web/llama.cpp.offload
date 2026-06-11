@@ -237,15 +237,22 @@ are provided.
 ### EAMC Sidecar Persistence
 
 `--moe-eamc-path PATH` is wired through common args, `llama-bench`, and
-`llama-moe-bench`. EAMC saves/loads a binary sidecar with shape/version checks
-and ignores incompatible sidecars with a warning. `test-eamc-cosine` covers
-sidecar round-trip.
+`llama-moe-bench`. EAMC loads/saves a binary sidecar with shape/version checks
+and ignores incompatible sidecars with a warning. During inference, EAMC stays
+online and appends rows to the in-memory corpus, but the sidecar is not written
+after each internal `llama_decode()` batch. Persistence is deferred to explicit
+benchmark end or context/session teardown. `test-eamc-cosine` covers sidecar
+round-trip and bounded FIFO/ring replacement.
 
 ### EAMC Predictor Overhead
 
 EAMC scoring now caches the nearest-neighbor ranking within a callback, so
 eviction candidate scans do not recompute the full cosine ranking repeatedly.
-The 1024 prefill + 256 decode bench gate completed three repeats successfully.
+Phase B removed the hidden per-token sidecar save and quadratic full-corpus
+redundancy pruning from the decode hot path. EAMC scoring is still expensive:
+the 256 prefill + 256 decode, 3-repeat Phase B run measured about
+90.54 ms/token in decode predictor scoring, so sparse/incremental EAMC scoring
+remains post-Phase-B work.
 
 ### Oracle Ambiguity
 

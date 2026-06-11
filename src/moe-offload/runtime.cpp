@@ -73,15 +73,22 @@ const manifest & get_manifest() {
 
 void begin_request() {
     auto & s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
-    if (s.options.enabled) {
-        ++s.request_idx;
-        s.active_request = {};
-        s.active_request.request_idx = s.request_idx;
-        s.active_request.repeat_idx = s.repeat_idx;
-        s.active_request.batch_idx = s.batch_idx;
-        s.active_request.phase = s.request_phase;
-        s.request_start = std::chrono::steady_clock::now();
+    bool enabled = false;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.options.enabled) {
+            ++s.request_idx;
+            s.active_request = {};
+            s.active_request.request_idx = s.request_idx;
+            s.active_request.repeat_idx = s.repeat_idx;
+            s.active_request.batch_idx = s.batch_idx;
+            s.active_request.phase = s.request_phase;
+            s.request_start = std::chrono::steady_clock::now();
+            enabled = true;
+        }
+    }
+    if (enabled) {
+        slot_pool_begin_request();
     }
 }
 
@@ -116,6 +123,13 @@ void end_request() {
     if (out) {
         out << s.prof->summary();
     }
+}
+
+bool flush_predictor() {
+    if (!runtime_enabled()) {
+        return true;
+    }
+    return slot_pool_flush_predictor();
 }
 
 void set_profile_request_context(int repeat_idx, int batch_idx, const char * phase) {

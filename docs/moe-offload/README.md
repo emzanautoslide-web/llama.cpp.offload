@@ -66,7 +66,13 @@ Default D-3/D-4 slot-pool traces are quiet in chat. Set
   -p "Hello" -n 32
 ```
 
-`--moe-predictor` accepts `lru` or `eamc`. `--moe-eamc-path PATH` selects the EAMC predictor sidecar; when omitted with `--moe-predictor eamc`, the runtime uses the model path with a `.eamc` suffix. `--moe-profile-csv PATH` and `--moe-profile-summary PATH` write profiling data.
+`--moe-predictor` accepts `lru` or `eamc`. `--moe-eamc-path PATH` selects the
+EAMC predictor sidecar; when omitted with `--moe-predictor eamc`, the runtime
+uses the model path with a `.eamc` suffix. EAMC updates remain online during
+inference, but sidecar persistence is deferred: the hot path updates the
+in-memory corpus and saves the sidecar only at explicit benchmark end or
+context/session teardown. `--moe-profile-csv PATH` and
+`--moe-profile-summary PATH` write profiling data.
 
 In streaming mode (`n_slots < n_experts`), the runtime auto-sizes the effective
 `n_ubatch` from the cache VRAM budget and model top-k instead of applying the
@@ -136,6 +142,10 @@ CSV columns:
 
 | Column | Meaning |
 | --- | --- |
+| `row_type` | `layer` for per-layer callback rows, `request` for one row per internal `llama_decode()` batch. |
+| `request_idx` | Monotonic internal decode-batch id. |
+| `repeat_idx` | Benchmark repeat id when set by `llama-moe-bench`, otherwise `-1`. |
+| `batch_idx` | Benchmark batch id when set by `llama-moe-bench`; prefill is `0`, decode tokens start at `1`. |
 | `token_idx` | First token index covered by this callback row. Prefill rows cover a ubatch; decode rows cover one token. |
 | `phase` | `prefill` or `decode`. |
 | `layer` | Logical MoE layer index. |
@@ -147,8 +157,20 @@ CSV columns:
 | `compute_us` | CUDA-event-timed compute interval for the layer, derived from begin/end events recorded on the compute stream and queried at `slot_pool_end_request()`. Each row's interval brackets the slot_table write of layer L through the topk callback of layer L+1 (or `end_request` for the final layer); this is an over-approximation that includes layer L's MoE compute plus the following attention block. |
 | `stall_us` | Host wall-clock around miss completion and compute-stream wait insertion for miss events. This is still an approximation of overlap loss, not a pure CUDA event duration. |
 | `pred_us` | Host microseconds spent in predictor `observe()` plus eviction `score()` calls for this row. |
+| `pred_observe_us` | Predictor observation time. |
+| `pred_score_us` | Predictor eviction-score time. |
+| `callback_wall_us` | Host wall-clock time for the MoE eval callback. |
+| `topk_d2h_us` | Host time spent reading top-k expert ids from the backend tensor. |
+| `slot_ids_h2d_us` | Host time spent writing remapped slot ids. |
+| `slot_table_h2d_us` | Host time spent writing the legacy slot-table path when used. |
 | `cache_resident_experts` | Number of experts resident for the layer after miss handling. |
 | `predictor` | `lru` or `eamc`. |
+| `request_wall_us` | Request-row wall time for the internal `llama_decode()` batch. |
+| `request_end_us` | Request-row time spent finalizing MoE profiler/predictor state. |
+| `predictor_end_us` | Request-row time spent appending online predictor state. For Phase B EAMC this is in-memory only. |
+| `predictor_save_us` | Request-row sidecar save time. This should be zero during per-token decode for Phase B EAMC. |
+| `profile_flush_us` | Request-row CSV flush time. |
+| `sidecar_write_bytes` | Request-row sidecar bytes written. This should be zero during per-token decode for Phase B EAMC. |
 
 ## Current State
 
@@ -157,8 +179,8 @@ Implemented in this slice:
 - `LLAMA_MOE_OFFLOAD` build option.
 - Guarded CLI/model parameters: `--moe-offload`, cache budget knobs, predictor choice, EAMC sidecar path, profile paths, and oracle fail-fast.
 - Loader metadata validation for `moe_offload.version`.
-- LRU and EAMC predictor implementations, including binary EAMC sidecar save/load.
-- Slot-cache model and profiling CSV/summary plumbing, including `pred_us` predictor overhead.
+- LRU and EAMC predictor implementations, including binary EAMC sidecar load/save with online in-memory updates and deferred persistence.
+- Slot-cache model and profiling CSV/summary plumbing, including predictor observe/score/end/save timing.
 - Guarded hooks at model load, decode request boundaries, and MoE top-k graph construction.
 - `llama-moe-repack` and `llama-moe-bench` targets.
 - **D-4**: Pre-allocated slot_table tensors via `create_unfiled_tensor`; zero-init of all slot tensors; adaptive streaming ubatch sizing from the slot/VRAM budget.
@@ -168,6 +190,7 @@ Implemented in this slice:
 - **G**: CUDA stream accessor (`moe_io_cuda_*` in `ggml/src/ggml-cuda/moe_offload_io.cu`), pinned-host staging, dedicated MoE H2D stream, event pool.
 - **H**: Eval-callback rewired to async H2D via `io_h2d_async_timed` + `io_compute_wait` (`cudaStreamWaitEvent` on the compute stream). Synchronous double-read of the miss blob removed.
 - **I**: Real `compute_us` via CUDA events. Profile rows are buffered per `llama_decode` batch and flushed at `slot_pool_end_request()` after `cudaEventElapsedTime` queries. Per-miss `h2d_us` now comes from event timing on the async path.
+- **Perf-B**: EAMC remains online in DRAM, but per-token sidecar saves were removed. Full-capacity EAMC uses FIFO/ring replacement instead of quadratic redundancy pruning; sidecars are saved at benchmark end or context/session teardown.
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
 - **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
 - **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. CUDA `MUL_MAT_ID` on `.slot` tensors bypasses the specialized MMVQ/MMQ/MMF paths and uses the generic sorted path for correctness-first validation.
@@ -258,7 +281,7 @@ CTest targets under label `moe-offload`:
 | Test | Phase | Purpose |
 |---|---|---|
 | `test-cuda-stream` | G | Pinned alloc + async H2D + event ordering smoke. |
-| `test-eamc-cosine` | K | EAMC cosine ordering, sidecar round-trip, and redundancy replacement on full insert. |
+| `test-eamc-cosine` | K / Perf-B | EAMC cosine ordering, sidecar round-trip, and bounded FIFO/ring replacement on full insert. |
 | `test-lru-eviction` | K | Hand-computed LRU score values, victim ordering, per-layer isolation. |
 | `test-manifest-roundtrip` | K | GGUF manifest sanity (version=2, table size, per-record file ranges). Self-skips with exit 0 when `LLAMA_MOE_TEST_GGUF` is unset. |
 | `test-repack-slices` | MVP closeout | Byte-level original-vs-repacked expert slice verification. Self-skips unless `LLAMA_MOE_TEST_ORIGINAL_GGUF` and `LLAMA_MOE_TEST_GGUF` are set. |

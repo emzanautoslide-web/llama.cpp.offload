@@ -31,6 +31,7 @@ const manifest &        get_manifest();
 
 void begin_request();
 void end_request();
+LLAMA_API bool flush_predictor();
 
 LLAMA_API void set_profile_request_context(int repeat_idx, int batch_idx, const char * phase);
 uint64_t current_request_idx();

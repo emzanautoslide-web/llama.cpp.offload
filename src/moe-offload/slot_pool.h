@@ -108,8 +108,15 @@ void slot_pool_shutdown_io();
 // back to synchronous ggml_backend_tensor_set).
 void slot_pool_set_compute_backend(ggml_backend_t backend);
 
-// Phase E-3: end the current request (calls predictor.end_request).
+// Reset per-request predictor observations before an internal decode batch.
+void slot_pool_begin_request();
+
+// End the current internal decode batch (calls predictor.end_request, but does
+// not persist predictor sidecars).
 void slot_pool_end_request();
+
+// Persist predictor state at a logical request/session boundary.
+bool slot_pool_flush_predictor();
 
 // Phase D-2: scheduler eval-callback. On post-eval of `ffn_moe_topk-<il>` it
 // reads selected expert IDs, ensures their blobs are resident in slots (loading

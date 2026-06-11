@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
@@ -150,9 +149,12 @@ public:
         if (!has_activation || capacity == 0) {
             return;
         }
-        corpus.push_back(current);
-        if (corpus.size() > capacity) {
-            evict_redundant();
+        if (corpus.size() < capacity) {
+            corpus.push_back(current);
+            next_replace = corpus.size() % capacity;
+        } else {
+            corpus[next_replace] = current;
+            next_replace = (next_replace + 1) % capacity;
         }
         invalidate_score_cache();
     }
@@ -207,6 +209,7 @@ public:
         corpus = std::move(loaded);
         capacity = (size_t) file_capacity;
         top_k = (size_t) file_top_k;
+        next_replace = capacity == 0 ? 0 : corpus.size() % capacity;
         invalidate_score_cache();
         std::fprintf(stderr, "[moe-eamc] loaded %zu EAMC row(s) from %s\n", corpus.size(), path.c_str());
         return true;
@@ -303,44 +306,11 @@ private:
         score_cache_valid = false;
     }
 
-    static float cosine_full(const std::vector<float> & a, const std::vector<float> & b) {
-        double dot = 0.0;
-        double norm_a = 0.0;
-        double norm_b = 0.0;
-        for (size_t i = 0; i < a.size(); ++i) {
-            dot += (double) a[i] * (double) b[i];
-            norm_a += (double) a[i] * (double) a[i];
-            norm_b += (double) b[i] * (double) b[i];
-        }
-        if (norm_a == 0.0 || norm_b == 0.0) {
-            return 0.0f;
-        }
-        return (float) (dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
-    }
-
-    void evict_redundant() {
-        size_t best = 0;
-        float best_mean = -std::numeric_limits<float>::infinity();
-        for (size_t i = 0; i < corpus.size(); ++i) {
-            double mean = 0.0;
-            for (size_t j = 0; j < corpus.size(); ++j) {
-                if (i != j) {
-                    mean += cosine_full(corpus[i], corpus[j]);
-                }
-            }
-            mean /= (double) std::max<size_t>(1, corpus.size() - 1);
-            if ((float) mean > best_mean) {
-                best_mean = (float) mean;
-                best = i;
-            }
-        }
-        corpus.erase(corpus.begin() + (ptrdiff_t) best);
-    }
-
     int n_layers;
     int n_experts;
     size_t capacity;
     size_t top_k;
+    size_t next_replace = 0;
     int current_layer = -1;
     uint64_t step = 0;
     std::vector<float> current;

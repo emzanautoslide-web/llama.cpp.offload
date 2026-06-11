@@ -472,6 +472,9 @@ llama_context::~llama_context() {
     // unconditionally — io_shutdown() is a no-op when the worker was never
     // started.
     if (llama_moe::runtime_enabled()) {
+        if (!llama_moe::flush_predictor()) {
+            LLAMA_LOG_WARN("%s: failed to flush MoE predictor state\n", __func__);
+        }
         llama_moe::slot_pool_shutdown_io();
     }
 #endif
