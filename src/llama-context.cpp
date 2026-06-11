@@ -1,5 +1,10 @@
 #include "llama-context.h"
 
+#ifdef LLAMA_MOE_OFFLOAD
+#include "moe-offload/runtime.h"
+#include "moe-offload/slot_pool.h"
+#endif
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -12,8 +17,10 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -29,6 +36,51 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     }
     throw std::runtime_error("Unsupported ctx type");
 }
+
+#ifdef LLAMA_MOE_OFFLOAD
+static bool llama_moe_env_is_off(const char * value) {
+    return value &&
+        (strcmp(value, "0") == 0 ||
+         strcmp(value, "off") == 0 ||
+         strcmp(value, "OFF") == 0 ||
+         strcmp(value, "false") == 0 ||
+         strcmp(value, "FALSE") == 0 ||
+         strcmp(value, "disabled") == 0 ||
+         strcmp(value, "DISABLED") == 0);
+}
+
+static float llama_moe_ubatch_safety() {
+    const char * value = getenv("LLAMA_MOE_UBATCH_SAFETY");
+    if (!value || !value[0]) {
+        return 1.0f;
+    }
+    char * end = nullptr;
+    const float parsed = strtof(value, &end);
+    if (end == value || !std::isfinite(parsed) || parsed <= 0.0f) {
+        LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_MOE_UBATCH_SAFETY=%s\n", __func__, value);
+        return 1.0f;
+    }
+    return parsed;
+}
+
+static uint32_t llama_moe_fixed_ubatch_from_env(uint32_t n_batch, bool * has_fixed) {
+    *has_fixed = false;
+    const char * value = getenv("LLAMA_MOE_STREAMING_UBATCH");
+    if (!value || !value[0] || strcmp(value, "auto") == 0 || strcmp(value, "AUTO") == 0 || llama_moe_env_is_off(value)) {
+        return 0;
+    }
+
+    char * end = nullptr;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || parsed == 0) {
+        LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_MOE_STREAMING_UBATCH=%s\n", __func__, value);
+        return 0;
+    }
+
+    *has_fixed = true;
+    return std::min<uint32_t>(n_batch, (uint32_t) parsed);
+}
+#endif
 
 llama_context::llama_context(
         const llama_model & model,
@@ -181,6 +233,29 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+#ifdef LLAMA_MOE_OFFLOAD
+    if (llama_moe::runtime_enabled() && llama_moe::streaming_mode()) {
+        const uint32_t requested = cparams.n_ubatch;
+        bool has_fixed = false;
+        const uint32_t fixed = llama_moe_fixed_ubatch_from_env(cparams.n_batch, &has_fixed);
+
+        if (llama_moe_env_is_off(getenv("LLAMA_MOE_STREAMING_UBATCH"))) {
+            LLAMA_LOG_INFO("%s: MoE streaming ubatch auto-sizing disabled: requested=%u n_slots=%u top_k=%u\n",
+                    __func__, requested, llama_moe::n_slots_per_layer(), hparams.n_expert_used);
+        } else if (has_fixed) {
+            cparams.n_ubatch = fixed;
+            LLAMA_LOG_INFO("%s: MoE streaming ubatch fixed by LLAMA_MOE_STREAMING_UBATCH: requested=%u effective=%u n_slots=%u top_k=%u\n",
+                    __func__, requested, cparams.n_ubatch, llama_moe::n_slots_per_layer(), hparams.n_expert_used);
+        } else {
+            const float safety = llama_moe_ubatch_safety();
+            const uint32_t adaptive = llama_moe::recommended_ubatch(requested, hparams.n_expert_used, safety);
+            cparams.n_ubatch = adaptive;
+            LLAMA_LOG_INFO("%s: MoE streaming ubatch auto-sized: requested=%u effective=%u n_slots=%u top_k=%u safety=%.3g\n",
+                    __func__, requested, cparams.n_ubatch, llama_moe::n_slots_per_layer(), hparams.n_expert_used, (double) safety);
+        }
+    }
+#endif
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -389,6 +464,17 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+#ifdef LLAMA_MOE_OFFLOAD
+    // Phase L.1: stop the MoE I/O worker thread before any backend buffers,
+    // pinned host buffers, or CUDA event pools owned by the slot pool are
+    // freed. Without this, the worker thread is still alive at process exit
+    // and trips STATUS_STACK_BUFFER_OVERRUN (-1073740791). Safe to call
+    // unconditionally — io_shutdown() is a no-op when the worker was never
+    // started.
+    if (llama_moe::runtime_enabled()) {
+        llama_moe::slot_pool_shutdown_io();
+    }
+#endif
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1275,7 +1361,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
+#ifdef LLAMA_MOE_OFFLOAD
+        if (llama_moe::runtime_enabled()) {
+            llama_moe::reset_graph_state();
+        }
+        if (llama_moe::runtime_enabled() && llama_moe::streaming_mode()) {
+            ggml_backend_sched_set_eval_callback(sched.get(), llama_moe::moe_eval_callback, nullptr);
+
+            // One-time async I/O init on first graph build in streaming mode.
+            static bool io_inited = false;
+            if (!io_inited) {
+                io_inited = true;
+                llama_moe::slot_pool_init_io(llama_moe::get_manifest().source_path);
+
+                // Phase H: hand the slot pool a CUDA backend so the
+                // eval-callback can stall the compute stream on async H2D
+                // events via cudaStreamWaitEvent. Single-device MVP: pick
+                // the first backend whose name starts with "CUDA".
+                ggml_backend_t cuda_be = nullptr;
+                const int n_be = ggml_backend_sched_get_n_backends(sched.get());
+                for (int i = 0; i < n_be; ++i) {
+                    ggml_backend_t be = ggml_backend_sched_get_backend(sched.get(), i);
+                    const char * name = be ? ggml_backend_name(be) : nullptr;
+                    if (name && strncmp(name, "CUDA", 4) == 0) {
+                        cuda_be = be;
+                        break;
+                    }
+                }
+                llama_moe::slot_pool_set_compute_backend(cuda_be);
+            }
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
+#else
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+#endif
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1302,6 +1422,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+#ifdef LLAMA_MOE_OFFLOAD
+        if (llama_moe::runtime_enabled()) {
+            if (!llama_moe::streaming_mode()) {
+                llama_moe::populate_slot_tables_identity();
+            }
+        }
+#endif
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2232,6 +2360,19 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     ggml_backend_sched_reset(sched.get());
+
+#ifdef LLAMA_MOE_OFFLOAD
+    // Phase J: graph_reserve() rebuilds the graph from scratch, allocating
+    // new topk/slot_table tensors. The MoE runtime caches topk→slot_table
+    // pointers across builds; if we don't clear them here, the eval callback
+    // can match a freshly-allocated tensor address against a stale entry
+    // from the previous graph and route through the wrong slot indices.
+    // This is the streaming numerical-drift bug surfaced by the Phase J
+    // golden-logits test.
+    if (llama_moe::runtime_enabled()) {
+        llama_moe::reset_graph_state();
+    }
+#endif
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
@@ -3925,7 +4066,13 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+#ifdef LLAMA_MOE_OFFLOAD
+    llama_moe::begin_request();
+#endif
     const int ret = ctx->decode(batch);
+#ifdef LLAMA_MOE_OFFLOAD
+    llama_moe::end_request();
+#endif
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

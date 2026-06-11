@@ -118,6 +118,11 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+option(LLAMA_MOE_OFFLOAD "llama: enable MoE expert offloading subsystem" OFF)
+
+if (LLAMA_MOE_OFFLOAD)
+    add_compile_definitions(LLAMA_MOE_OFFLOAD)
+endif()
 
 
 # Required for relocatable CMake package

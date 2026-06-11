@@ -21,6 +21,8 @@
 *.swp
 *.tmp
 *.DS_Store
+*.csv
+*.txt
 
 # IDE / OS
 

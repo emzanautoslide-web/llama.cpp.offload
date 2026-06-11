@@ -10,6 +10,10 @@
 #include "llama-model-saver.h"
 #include "llama-model.h"
 
+#ifdef LLAMA_MOE_OFFLOAD
+#include "moe-offload/loader.h"
+#endif
+
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
@@ -280,6 +284,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
+
+#ifdef LLAMA_MOE_OFFLOAD
+        if (!llama_moe::configure_from_params(params, fname, ml)) {
+            return {-1, nullptr};
+        }
+#endif
+
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());

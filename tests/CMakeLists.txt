@@ -308,3 +308,50 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# ---------------------------------------------------------------------------
+# MoE offload tests (Phase G+ of implementation_plan_mvp_20260529.md)
+# ---------------------------------------------------------------------------
+if (LLAMA_MOE_OFFLOAD)
+    llama_build_and_test(moe-offload/test-cuda-stream.cpp LABEL "moe-offload")
+    target_include_directories(test-cuda-stream PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    find_package(CUDAToolkit QUIET)
+    if (TARGET CUDA::cudart)
+        target_link_libraries(test-cuda-stream PRIVATE CUDA::cudart)
+    endif()
+
+    # Phase K unit tests — see docs/implementation_plan_mvp_20260529.md §3.
+    # predictor.cpp is recompiled into each predictor test exe because the
+    # symbols make_predictor / lru_predictor / eamc_predictor are not
+    # LLAMA_API-exported from llama.dll on Windows.
+    llama_build_and_test(moe-offload/test-eamc-cosine.cpp
+        ${PROJECT_SOURCE_DIR}/src/moe-offload/predictor.cpp
+        LABEL "moe-offload")
+    target_include_directories(test-eamc-cosine PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(moe-offload/test-lru-eviction.cpp
+        ${PROJECT_SOURCE_DIR}/src/moe-offload/predictor.cpp
+        LABEL "moe-offload")
+    target_include_directories(test-lru-eviction PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    # Manifest round-trip uses only the public gguf C API; it skips with
+    # exit 0 when LLAMA_MOE_TEST_GGUF is unset.
+    llama_build_and_test(moe-offload/test-manifest-roundtrip.cpp
+        LABEL "moe-offload")
+
+    # Byte-slice verifier compares the original GGUF against the repacked
+    # GGUF when LLAMA_MOE_TEST_ORIGINAL_GGUF and LLAMA_MOE_TEST_GGUF are set.
+    llama_build_and_test(moe-offload/test-repack-slices.cpp
+        LABEL "moe-offload")
+
+    if (LLAMA_BUILD_TOOLS)
+        add_test(
+            NAME test-moe-oracle-failfast
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${CMAKE_COMMAND}
+                -DORACLE_EXE=$<TARGET_FILE:llama-completion>
+                -DORACLE_MODEL=${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf
+                -P ${PROJECT_SOURCE_DIR}/cmake/moe-oracle-failfast.cmake)
+        set_property(TEST test-moe-oracle-failfast PROPERTY LABELS "moe-offload")
+    endif()
+endif()

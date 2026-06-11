@@ -315,6 +315,16 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+    #ifdef LLAMA_MOE_OFFLOAD
+        // MoE expert offloading parameters. Only available when built with LLAMA_MOE_OFFLOAD.
+        const char * moe_predictor;
+        const char * moe_eamc_path;
+        const char * moe_profile_csv;
+        const char * moe_profile_summary;
+        uint64_t     moe_cache_vram_mb;
+        float        moe_cache_vram_frac;
+    #endif
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -324,6 +334,10 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+    #ifdef LLAMA_MOE_OFFLOAD
+        bool moe_offload;     // enable SSD-backed MoE expert offloading path
+        bool moe_oracle;      // diagnostic oracle mode for profiling overlap cost
+    #endif
     };
 
     struct llama_sampler_seq_config {

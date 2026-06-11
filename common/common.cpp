@@ -1536,6 +1536,17 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+#ifdef LLAMA_MOE_OFFLOAD
+    mparams.moe_predictor       = params.moe_predictor.c_str();
+    mparams.moe_eamc_path       = params.moe_eamc_path.empty() ? nullptr : params.moe_eamc_path.c_str();
+    mparams.moe_profile_csv     = params.moe_profile_csv.empty() ? nullptr : params.moe_profile_csv.c_str();
+    mparams.moe_profile_summary = params.moe_profile_summary.empty() ? nullptr : params.moe_profile_summary.c_str();
+    mparams.moe_cache_vram_mb   = params.moe_cache_vram_mb < 0 ? 0 : (uint64_t) params.moe_cache_vram_mb;
+    mparams.moe_cache_vram_frac = params.moe_cache_vram_frac;
+    mparams.moe_offload         = params.moe_offload;
+    mparams.moe_oracle          = params.moe_oracle;
+#endif
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

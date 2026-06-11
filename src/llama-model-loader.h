@@ -182,6 +182,21 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    // Allocate a tensor in the loader's per-buft ctx_map that does NOT come from any source GGUF.
+    // The tensor is created in a backend buffer (same path as filed tensors) but skipped by
+    // load_all_data because its name is not registered in weights_map. Used by the MoE offload
+    // subsystem to allocate per-layer VRAM slot tensors for routed expert weights.
+    struct ggml_tensor * create_unfiled_tensor(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        const std::string & name, ggml_type type, ggml_op op,
+        const std::initializer_list<int64_t> & ne);
+
+    // Tell the loader that the GGUF weight with this name will NOT be materialized via
+    // create_tensor (because the MoE offload subsystem has taken over its data plane).
+    // Adjusts n_created and size_data so done_getting_tensors and the progress counter
+    // stay consistent with what is actually loaded.
+    void mark_tensor_unloaded(const std::string & name);
+
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 
     void done_getting_tensors(bool partial = false) const;
