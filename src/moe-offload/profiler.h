@@ -106,9 +106,14 @@ struct profile_summary_context {
     bool streaming = false;
     bool cache_reset_between_repeats = false;
     bool warm_cache = false;
+    bool hot_start = false;
     double ttft_ms = 0.0;
+    double cold_ttft_ms = 0.0;
+    double warm_ttft_ms = 0.0;
     double tpot_ms = 0.0;
     double total_ms = 0.0;
+    int cold_prefill_count = 0;
+    int warm_prefill_count = 0;
     uint64_t vram_peak_bytes = 0;
     uint64_t vram_total_bytes = 0;
     uint64_t dram_peak_bytes = 0;

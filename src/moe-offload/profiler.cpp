@@ -25,6 +25,65 @@ double us_per_token_ms(int64_t usec, int tokens, int repeats) {
     return (double) usec / 1000.0 / (double) denom;
 }
 
+double safe_div(double numerator, uint64_t denominator) {
+    return denominator == 0 ? 0.0 : numerator / (double) denominator;
+}
+
+void append_io_breakdown(std::ostringstream & out, const char * label, const profile_phase_stats & stats, int tokens, int repeats) {
+    out << "I/O breakdown (" << label << ", mean per token):\n";
+    out << "  ssd_read       " << std::setw(8) << std::setprecision(2)
+        << us_per_token_ms(stats.ssd_read_us, tokens, repeats) << " ms\n";
+    out << "  h2d            " << std::setw(8)
+        << us_per_token_ms(stats.h2d_us, tokens, repeats) << " ms\n";
+    out << "  gpu_compute    " << std::setw(8)
+        << us_per_token_ms(stats.compute_us, tokens, repeats) << " ms\n";
+    out << "  stall (overlap loss) " << std::setw(8)
+        << us_per_token_ms(stats.stall_us, tokens, repeats) << " ms\n";
+    out << "  predictor      " << std::setw(8)
+        << us_per_token_ms(stats.pred_us, tokens, repeats) << " ms\n\n";
+}
+
+void append_profiler_breakdown(std::ostringstream & out, const char * label,
+        const profile_phase_stats & stats, int tokens, int repeats) {
+    const uint64_t token_total = (uint64_t) std::max(1, tokens) * (uint64_t) std::max(1, repeats);
+
+    out << "Profiler breakdown (" << label << ", mean per token):\n";
+    out << "  predictor_observe " << std::setw(8)
+        << us_per_token_ms(stats.pred_observe_us, tokens, repeats) << " ms\n";
+    out << "  predictor_score   " << std::setw(8)
+        << us_per_token_ms(stats.pred_score_us, tokens, repeats) << " ms\n";
+    out << "  callback_wall     " << std::setw(8)
+        << us_per_token_ms(stats.callback_wall_us, tokens, repeats) << " ms\n";
+    out << "  topk_d2h          " << std::setw(8)
+        << us_per_token_ms(stats.topk_d2h_us, tokens, repeats) << " ms\n";
+    out << "  slot_ids_h2d      " << std::setw(8)
+        << us_per_token_ms(stats.slot_ids_h2d_us, tokens, repeats) << " ms\n";
+    out << "  slot_table_h2d    " << std::setw(8)
+        << us_per_token_ms(stats.slot_table_h2d_us, tokens, repeats) << " ms\n";
+    out << "  eamc_cosine       " << std::setw(8)
+        << us_per_token_ms(stats.eamc_cosine_us, tokens, repeats) << " ms\n";
+    out << "  eamc_materialize  " << std::setw(8)
+        << us_per_token_ms(stats.eamc_score_materialize_us, tokens, repeats) << " ms\n";
+    out << "  eamc_rows_scored  " << std::setw(8) << std::setprecision(1)
+        << safe_div((double) stats.eamc_rows_scored, token_total) << " rows/token\n";
+    out << std::setprecision(2);
+    out << "  eamc_cache_hits   " << std::setw(8)
+        << safe_div((double) stats.eamc_score_cache_hits, token_total) << " hits/token\n";
+    out << "  eamc_cache_misses " << std::setw(8)
+        << safe_div((double) stats.eamc_score_cache_misses, token_total) << " misses/token\n";
+    out << "  request_end       " << std::setw(8)
+        << us_per_token_ms(stats.request_end_us, tokens, repeats) << " ms\n";
+    out << "  predictor_end     " << std::setw(8)
+        << us_per_token_ms(stats.predictor_end_us, tokens, repeats) << " ms\n";
+    out << "  predictor_save    " << std::setw(8)
+        << us_per_token_ms(stats.predictor_save_us, tokens, repeats) << " ms\n";
+    out << "  profile_flush     " << std::setw(8)
+        << us_per_token_ms(stats.profile_flush_us, tokens, repeats) << " ms\n";
+    out << "  sidecar_written   " << std::setw(8)
+        << bytes_to_mib(safe_div((double) stats.sidecar_write_bytes, token_total))
+        << " MB/token\n\n";
+}
+
 } // namespace
 
 profiler::profiler(const std::string & csv_path) {
@@ -266,10 +325,11 @@ std::string format_summary(
         }
         out << "\n\n";
     }
-    if (ctx.cache_reset_between_repeats || ctx.warm_cache) {
+    if (ctx.cache_reset_between_repeats || ctx.warm_cache || ctx.hot_start) {
         out << "calibration: "
             << "cache_reset_between_repeats=" << (ctx.cache_reset_between_repeats ? "true" : "false")
             << "  warm_cache=" << (ctx.warm_cache ? "true" : "false")
+            << "  hot_start=" << (ctx.hot_start ? "true" : "false")
             << "\n\n";
     }
 
@@ -290,56 +350,19 @@ std::string format_summary(
     out << "SSD bytes read (decode): " << std::setprecision(2) << bytes_to_gib(profile.decode.ssd_bytes)
         << " GB  (avg " << bytes_to_mib(decode_bytes_per_token) << " MB/token)\n";
     out << "TTFT: " << std::setprecision(1) << ctx.ttft_ms << " ms\n";
+    if (ctx.cold_prefill_count > 0 || ctx.warm_prefill_count > 0) {
+        out << "TTFT cold: " << std::setprecision(1) << ctx.cold_ttft_ms
+            << " ms  (n=" << ctx.cold_prefill_count << ")\n";
+        out << "TTFT warm: " << std::setprecision(1) << ctx.warm_ttft_ms
+            << " ms  (n=" << ctx.warm_prefill_count << ")\n";
+    }
     out << "TPOT: " << std::setprecision(2) << ctx.tpot_ms << " ms\n";
     out << "total: " << std::setprecision(1) << ctx.total_ms << " ms\n\n";
 
-    out << "I/O breakdown (decode, mean per token):\n";
-    out << "  ssd_read       " << std::setw(8) << std::setprecision(2)
-        << us_per_token_ms(profile.decode.ssd_read_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  h2d            " << std::setw(8)
-        << us_per_token_ms(profile.decode.h2d_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  gpu_compute    " << std::setw(8)
-        << us_per_token_ms(profile.decode.compute_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  stall (overlap loss) " << std::setw(8)
-        << us_per_token_ms(profile.decode.stall_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  predictor      " << std::setw(8)
-        << us_per_token_ms(profile.decode.pred_us, ctx.n_gen, ctx.n_repeat) << " ms\n\n";
-
-    out << "Profiler breakdown (decode, mean per token):\n";
-    out << "  predictor_observe " << std::setw(8)
-        << us_per_token_ms(profile.decode.pred_observe_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  predictor_score   " << std::setw(8)
-        << us_per_token_ms(profile.decode.pred_score_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  callback_wall     " << std::setw(8)
-        << us_per_token_ms(profile.decode.callback_wall_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  topk_d2h          " << std::setw(8)
-        << us_per_token_ms(profile.decode.topk_d2h_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  slot_ids_h2d      " << std::setw(8)
-        << us_per_token_ms(profile.decode.slot_ids_h2d_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  slot_table_h2d    " << std::setw(8)
-        << us_per_token_ms(profile.decode.slot_table_h2d_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  eamc_cosine       " << std::setw(8)
-        << us_per_token_ms(profile.decode.eamc_cosine_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  eamc_materialize  " << std::setw(8)
-        << us_per_token_ms(profile.decode.eamc_score_materialize_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  eamc_rows_scored  " << std::setw(8) << std::setprecision(1)
-        << ((double) profile.decode.eamc_rows_scored / (double) decode_tokens_total) << " rows/token\n";
-    out << std::setprecision(2);
-    out << "  eamc_cache_hits   " << std::setw(8)
-        << ((double) profile.decode.eamc_score_cache_hits / (double) decode_tokens_total) << " hits/token\n";
-    out << "  eamc_cache_misses " << std::setw(8)
-        << ((double) profile.decode.eamc_score_cache_misses / (double) decode_tokens_total) << " misses/token\n";
-    out << "  request_end       " << std::setw(8)
-        << us_per_token_ms(profile.decode.request_end_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  predictor_end     " << std::setw(8)
-        << us_per_token_ms(profile.decode.predictor_end_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  predictor_save    " << std::setw(8)
-        << us_per_token_ms(profile.decode.predictor_save_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  profile_flush     " << std::setw(8)
-        << us_per_token_ms(profile.decode.profile_flush_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
-    out << "  sidecar_written   " << std::setw(8)
-        << bytes_to_mib((double) profile.decode.sidecar_write_bytes / (double) decode_tokens_total)
-        << " MB/token\n\n";
+    append_io_breakdown(out, "prefill", profile.prefill, ctx.n_prompt, ctx.n_repeat);
+    append_profiler_breakdown(out, "prefill", profile.prefill, ctx.n_prompt, ctx.n_repeat);
+    append_io_breakdown(out, "decode", profile.decode, ctx.n_gen, ctx.n_repeat);
+    append_profiler_breakdown(out, "decode", profile.decode, ctx.n_gen, ctx.n_repeat);
 
     out << "Wall/profile reconciliation (decode):\n";
     out << "  wall_decode_us        " << wall_decode_us << '\n';

@@ -947,6 +947,56 @@ void lru_touch(slot_pool_state::layer_cache & lc, int32_t expert) {
 
 } // namespace
 
+bool slot_pool_hot_start(const std::vector<std::vector<int>> & experts_by_layer) {
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    wait_all_h2d_buffers(s);
+
+    if (!s.configured || s.n_slots == 0 || s.n_slots >= get_manifest().n_experts_per_layer) {
+        return true;
+    }
+
+    const manifest & mf = get_manifest();
+    if (!mf.present || experts_by_layer.empty()) {
+        return true;
+    }
+
+    uint64_t loaded = 0;
+    for (uint32_t logical = 0; logical < mf.n_layers && logical < experts_by_layer.size(); ++logical) {
+        auto & lc = s.cache[(size_t) logical];
+        lc.exp2slot.clear();
+        lc.lru.clear();
+        lc.lru_it.clear();
+        lc.fingerprints.clear();
+        std::fill(lc.slot_to_expert.begin(), lc.slot_to_expert.end(), -1);
+
+        uint32_t slot = 0;
+        std::unordered_set<int> seen;
+        for (int expert : experts_by_layer[(size_t) logical]) {
+            if (slot >= s.n_slots) {
+                break;
+            }
+            if (expert < 0 || expert >= (int) mf.n_experts_per_layer || !seen.insert(expert).second) {
+                continue;
+            }
+            if (!load_expert_into_slot(s, mf, logical, expert, (int32_t) slot)) {
+                return false;
+            }
+            lc.slot_to_expert[(size_t) slot] = expert;
+            lc.exp2slot[expert] = (int32_t) slot;
+            lru_touch(lc, expert);
+            ++slot;
+            ++loaded;
+        }
+    }
+
+    if (loaded > 0) {
+        LLAMA_LOG_INFO("%s: preloaded %llu expert slot(s) across %u layer(s)\n",
+                __func__, (unsigned long long) loaded, mf.n_layers);
+    }
+    return true;
+}
+
 bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     const auto callback_start = std::chrono::steady_clock::now();
     (void) user_data;

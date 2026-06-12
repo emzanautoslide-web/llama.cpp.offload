@@ -1,6 +1,6 @@
 # MoE Offload Known Issues
 
-Status as of the guarded Phase I validation on 2026-06-12.
+Status as of the guarded Phase J calibration on 2026-06-12.
 
 ## Open
 
@@ -165,9 +165,25 @@ Current status:
   to 6202.5 ms, but decode TPOT regressed from 36.72 ms/token to
   40.85 ms/token and decode callback wall time rose from 22.40 ms/token to
   26.00 ms/token. Keep `LLAMA_MOE_PREFILL_MMVQ=1` experimental/default-off.
+- Phase J added cold/warm TTFT reporting and prefill I/O/profiler breakdowns
+  to `llama-moe-bench`. The 16 GiB cache matrix showed that 12000 MiB is the
+  practical budget for effective ubatch 16, 14000 MiB is only slightly faster
+  and nearly fills VRAM, and 16000 MiB over-pressures VRAM and regresses decode
+  TPOT badly.
 - `.slot` MMQ/MMF, prefill graphs/fusion, generic sorted graph capture, normal
   top-k fusion, and non-GLU fusion remain bypassed or disabled until
   separately validated.
+
+### Benchmark Hot-Start Is Experimental
+
+`llama-moe-bench --moe-hot-start` can preload ranked experts from an EAMC
+sidecar before the measured prefill. This is benchmark-only calibration
+plumbing; it does not affect `llama-cli` defaults.
+
+The Phase J smoke run preloaded 3840 slots across 40 layers, but TTFT worsened
+relative to the warm-cache smoke. Keep hot-start default-off until a profile
+source predicts the actual first prompt better and shows a cold-TTFT win without
+decode correctness or TPOT regressions.
 
 ### EAMC Row Caps Are Diagnostic Only
 

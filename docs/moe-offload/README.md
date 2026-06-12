@@ -115,7 +115,12 @@ factor.
 
 The bench tool enables MoE offload automatically, runs prefill + decode loops,
 and always prints the summary report to stdout. It accepts `-ub`, `--ubatch`,
-and `--ubatch-size` for explicit prefill-ubatch measurements. If `--moe-profile-summary` is
+and `--ubatch-size` for explicit prefill-ubatch measurements. Use
+`--moe-reset-cache-between-repeats` to measure cold-cache prefill for every
+repeat, `--moe-warm-cache` to run one unmeasured cache warmup before timing,
+and `--moe-hot-start` for benchmark-only EAMC-sidecar preloading. Hot-start is
+experimental and default-off; it is useful for calibration, not a recommended
+default. If `--moe-profile-summary` is
 set, `llama-moe-bench` writes the same §4.7 report to that path after all
 repeats complete. During long runs, it also checkpoints the same summary file
 after prefill and after each completed repeat, so the file appears before the
@@ -153,8 +158,35 @@ cache hit rate (prefill): 0.0%
 cache hit rate (decode): 78.3%
 SSD bytes read (decode): 3.42 GB  (avg 13.4 MB/token)
 TTFT: 1320.4 ms
+TTFT cold: 1320.4 ms  (n=1)
+TTFT warm: 0.0 ms  (n=0)
 TPOT: 38.57 ms
 total: 11194.6 ms
+
+I/O breakdown (prefill, mean per token):
+  ssd_read           6.82 ms
+  h2d                4.87 ms
+  gpu_compute        7.49 ms
+  stall (overlap loss)      0.09 ms
+  predictor          0.35 ms
+
+Profiler breakdown (prefill, mean per token):
+  predictor_observe     0.00 ms
+  predictor_score       0.35 ms
+  callback_wall         8.48 ms
+  topk_d2h              0.11 ms
+  slot_ids_h2d          0.03 ms
+  slot_table_h2d        0.00 ms
+  eamc_cosine           0.34 ms
+  eamc_materialize      0.00 ms
+  eamc_rows_scored    152.0 rows/token
+  eamc_cache_hits     134.85 hits/token
+  eamc_cache_misses     0.15 misses/token
+  request_end           0.07 ms
+  predictor_end         0.01 ms
+  predictor_save        0.00 ms
+  profile_flush         0.00 ms
+  sidecar_written       0.00 MB/token
 
 I/O breakdown (decode, mean per token):
   ssd_read          21.50 ms
@@ -257,6 +289,7 @@ Implemented in this slice:
 - **Perf-G**: `LLAMA_MOE_SLOT_GLU_FUSION=1` enables the guarded decode-only `.slot` quantized `MUL_MAT_ID + GLU` fusion path on top of `LLAMA_MOE_SLOT_MMVQ=1`. On the 8000 MiB EAMC benchmark this improved TPOT from 31.56 ms/token to 30.67 ms/token versus the Phase F guard stack in the same build and reduced callback wall time from 17.78 ms/token to 17.06 ms/token; `gpu_compute` was effectively flat at 10.44 to 10.37 ms/token and H2D, hit rate, misses/token, and top-k D2H stayed flat.
 - **Perf-H**: Phase H fixed callback reads of strided top-k views by using `ggml_backend_tensor_get_2d()` when the top-k tensor is a non-contiguous view. This is on the default path and explains the large prefill jump: versus the Phase G GLU run, Phase H baseline prefill improved from 14021.9 ms to 5070.4 ms, average experts observed per prefill callback fell from 64.0 to about 20.7, prefill misses fell from 44581 to 11610, and prefill callback wall time fell from 23467 ms to 6498 ms. Separately, `LLAMA_MOE_TOPK_FUSION_DIAG=1` enables an opt-in diagnostic single-token decode top-k MoE fusion path. Phase H fixed the earlier top-k golden-logit failure by moving the streaming callback point from `ffn_moe_topk` to final routing weights while still reading IDs from the original top-k tensor. Synthetic routing, golden logits, and chat smoke passed, including the full MMVQ + graphs + GLU stack, but the 8000 MiB same-build EAMC top-k-fusion benchmark was flat: TPOT 31.91 to 31.88 ms/token and `topk_d2h_us` 1.58 to 1.58 ms/token. Keep top-k fusion default-off.
 - **Perf-I**: `LLAMA_MOE_PREFILL_MMVQ=1`, used together with `LLAMA_MOE_SLOT_MMVQ=1`, enables the guarded multi-token `.slot` MMVQ prefill path. Synthetic CUDA coverage now checks the multi-token path with changing slot IDs and changed slot tensor contents, and the guarded stack passed raw golden logits (`max|d|=0`) plus `llama-cli --jinja --reasoning off` chat smoke at the default ubatch and forced `LLAMA_MOE_STREAMING_UBATCH=8`. In the 8000 MiB EAMC same-build benchmark it improved TTFT from 6505.2 ms to 6202.5 ms, but decode TPOT regressed from 36.72 ms/token to 40.85 ms/token, so the guard remains experimental and default-off.
+- **Perf-J**: `llama-moe-bench` now reports cold and warm TTFT separately, emits prefill I/O/profiler breakdowns alongside decode, and supports `--moe-reset-cache-between-repeats`, `--moe-warm-cache`, and benchmark-only `--moe-hot-start`. On the 16 GiB dev box, the cache matrix showed 8000 MiB reaches effective ubatch 8, 12000 MiB reaches effective ubatch 16 with a clear TTFT/TPOT improvement, 14000 MiB is slightly faster but nearly fills VRAM, and 16000 MiB over-pressures VRAM and badly regresses decode. Hot-start is mechanically wired but remains experimental/default-off because the smoke run worsened TTFT.
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
 - **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke, the Phase E/F `test-slot-mmvq` CUDA micro-test, and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
 - **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. By default CUDA `MUL_MAT_ID` on `.slot` tensors uses the generic sorted path for correctness-first validation. The guarded decode-only MMVQ path is available through `LLAMA_MOE_SLOT_MMVQ=1`, with decode-only CUDA graphs additionally gated by `LLAMA_MOE_SLOT_GRAPHS=1`, decode-only GLU fusion gated by `LLAMA_MOE_SLOT_GLU_FUSION=1`, guarded multi-token MMVQ prefill gated by `LLAMA_MOE_PREFILL_MMVQ=1`, and diagnostic-only decode top-k fusion gated by `LLAMA_MOE_TOPK_FUSION_DIAG=1`; MMQ/MMF, prefill graphs/fusion, generic sorted graph capture, and normal top-k MoE fusion remain disabled for `.slot`/offload.

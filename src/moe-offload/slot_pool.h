@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <string>
+#include <vector>
 
 struct ggml_tensor;
 struct llama_hparams;
@@ -25,6 +26,11 @@ void reset_slot_pool();
 // Reset only streaming cache residency and counters. Slot tensors and graph
 // registrations remain intact. Intended for benchmark calibration.
 LLAMA_API void slot_pool_reset_cache();
+
+// Benchmark-only hot start: preload selected experts into streaming slots
+// before measured prefill. `experts_by_layer[logical_layer]` is ordered by
+// caller preference; the loader fills at most n_slots per layer.
+LLAMA_API bool slot_pool_hot_start(const std::vector<std::vector<int>> & experts_by_layer);
 
 // Returns the uniform slot count per MoE layer.
 LLAMA_API uint32_t n_slots_per_layer();
