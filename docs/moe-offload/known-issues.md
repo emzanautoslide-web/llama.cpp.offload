@@ -1,6 +1,6 @@
 # MoE Offload Known Issues
 
-Status as of the guarded Phase H validation on 2026-06-12.
+Status as of the guarded Phase I validation on 2026-06-12.
 
 ## Open
 
@@ -23,9 +23,12 @@ Current status:
 - Async-H2D diagnostics, forced no-hit reloads, identity slot-table fill, and
   compute synchronization diagnostics did not fix the chat issue.
 - Raw-completion golden-logit gates have passed at larger ubatches, including
-  the Phase F `LLAMA_MOE_SLOT_MMVQ=1` + `LLAMA_MOE_SLOT_GRAPHS=1` gate. That
-  does not close the chat-prefill issue because the failing surface is
-  formatted interactive chat.
+  the Phase I `LLAMA_MOE_SLOT_MMVQ=1` + `LLAMA_MOE_PREFILL_MMVQ=1` +
+  `LLAMA_MOE_SLOT_GRAPHS=1` + `LLAMA_MOE_SLOT_GLU_FUSION=1` gate. The Phase I
+  formatted chat smoke also passed at the default ubatch and forced
+  `LLAMA_MOE_STREAMING_UBATCH=8`, but the historical failures were prompt- and
+  frontend-sensitive, so the interactive default remains ubatch 1 until the
+  broader Phase K matrix is rerun.
 
 Mitigation:
 
@@ -152,9 +155,19 @@ Current status:
 - Phase H also fixed top-k fusion correctness under
   `LLAMA_MOE_TOPK_FUSION_DIAG=1`, but kept it default-off because decode TPOT
   and `topk_d2h_us` were flat in the same-build top-k-fusion benchmark.
-- `.slot` MMQ/MMF, multi-token prefill fast paths, generic sorted graph
-  capture, normal top-k fusion, and non-GLU fusion remain bypassed or disabled
-  until separately validated.
+- Phase I added guarded multi-token `.slot` MMVQ prefill behind
+  `LLAMA_MOE_PREFILL_MMVQ=1`, used together with `LLAMA_MOE_SLOT_MMVQ=1`.
+  Synthetic CUDA coverage passed with changing slot IDs and changed slot tensor
+  contents, raw golden logits passed with `max|d|=0`, and `llama-cli --jinja
+  --reasoning off` chat smoke passed at default ubatch and forced
+  `LLAMA_MOE_STREAMING_UBATCH=8`.
+- The Phase I same-build 8000 MiB EAMC benchmark improved TTFT from 6505.2 ms
+  to 6202.5 ms, but decode TPOT regressed from 36.72 ms/token to
+  40.85 ms/token and decode callback wall time rose from 22.40 ms/token to
+  26.00 ms/token. Keep `LLAMA_MOE_PREFILL_MMVQ=1` experimental/default-off.
+- `.slot` MMQ/MMF, prefill graphs/fusion, generic sorted graph capture, normal
+  top-k fusion, and non-GLU fusion remain bypassed or disabled until
+  separately validated.
 
 ### EAMC Row Caps Are Diagnostic Only
 

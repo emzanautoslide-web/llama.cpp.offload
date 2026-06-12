@@ -4,10 +4,11 @@
 // The test builds a synthetic `.slot` MUL_MAT_ID graph and compares the CUDA
 // output against a CPU reference computed from the same quantized slot tensor.
 // It runs the default generic sorted path, the guarded LLAMA_MOE_SLOT_MMVQ=1
-// path, the LLAMA_MOE_SLOT_GRAPHS=1 replay path, and Phase G's guarded
-// LLAMA_MOE_SLOT_GLU_FUSION=1 decode-only GLU fusion. A prefill-shaped batch
-// is also checked with the guards enabled to verify it still falls back
-// cleanly.
+// decode path, the guarded LLAMA_MOE_PREFILL_MMVQ=1 multi-token path, the
+// LLAMA_MOE_SLOT_GRAPHS=1 replay path, and Phase G's guarded
+// LLAMA_MOE_SLOT_GLU_FUSION=1 decode-only GLU fusion. Prefill graphs and GLU
+// fusion are also checked with the guards enabled to verify they still fall
+// back cleanly.
 // ===========================================================================
 
 #include "ggml.h"
@@ -70,6 +71,14 @@ void set_slot_mmvq_env(bool enabled) {
     _putenv(enabled ? "LLAMA_MOE_SLOT_MMVQ=1" : "LLAMA_MOE_SLOT_MMVQ=0");
 #else
     setenv("LLAMA_MOE_SLOT_MMVQ", enabled ? "1" : "0", 1);
+#endif
+}
+
+void set_prefill_mmvq_env(bool enabled) {
+#if defined(_WIN32)
+    _putenv(enabled ? "LLAMA_MOE_PREFILL_MMVQ=1" : "LLAMA_MOE_PREFILL_MMVQ=0");
+#else
+    setenv("LLAMA_MOE_PREFILL_MMVQ", enabled ? "1" : "0", 1);
 #endif
 }
 
@@ -309,8 +318,10 @@ bool check_output(const char * name, const std::vector<float> & out, const std::
 }
 
 bool run_cuda_case(const char * name, ggml_backend_t backend, ggml_type type,
-        int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens, bool enable_mmvq, bool enable_graphs = false) {
+        int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens,
+        bool enable_mmvq, bool enable_graphs = false, bool enable_prefill_mmvq = false) {
     set_slot_mmvq_env(enable_mmvq);
+    set_prefill_mmvq_env(enable_prefill_mmvq);
     set_slot_graphs_env(enable_graphs);
 
     graph_case gc = build_case(type, k, m, n_slots, n_used, n_tokens);
@@ -356,9 +367,67 @@ bool run_cuda_case(const char * name, ggml_backend_t backend, ggml_type type,
     return ok;
 }
 
+bool run_cuda_prefill_replay_case(const char * name, ggml_backend_t backend, ggml_type type,
+        int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens) {
+    set_slot_mmvq_env(true);
+    set_prefill_mmvq_env(true);
+    set_slot_graphs_env(false);
+
+    graph_case gc = build_case(type, k, m, n_slots, n_used, n_tokens);
+    if (!gc.ctx) {
+        fprintf(stderr, "[test-slot-mmvq] %s: ggml_init failed\n", name);
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(gc.ctx, backend);
+    if (!buffer) {
+        ggml_free(gc.ctx);
+        fprintf(stderr, "[test-slot-mmvq] %s: tensor allocation failed\n", name);
+        return false;
+    }
+
+    bool ok = true;
+    for (int iter = 0; iter < 5; ++iter) {
+        tensor_data data;
+        fill_data(data, type, k, m, n_slots, n_used, n_tokens, iter);
+        if (!compute_reference(data, type, k, m, n_used, n_tokens)) {
+            fprintf(stderr, "[test-slot-mmvq] %s: reference conversion unavailable\n", name);
+            ok = false;
+            break;
+        }
+
+        ggml_backend_tensor_set(gc.as, data.as_quant.data(), 0, data.as_quant.size());
+        ggml_backend_tensor_set(gc.b, data.b.data(), 0, data.b.size()*sizeof(float));
+        ggml_backend_tensor_set(gc.ids, data.ids.data(), 0, data.ids.size()*sizeof(int32_t));
+
+        const ggml_status status = ggml_backend_graph_compute(backend, gc.gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[test-slot-mmvq] %s iter=%d: graph compute failed: %s\n",
+                    name, iter, ggml_status_to_string(status));
+            ok = false;
+            break;
+        }
+
+        std::vector<float> out((size_t) ggml_nelements(gc.out));
+        ggml_backend_tensor_get(gc.out, out.data(), 0, out.size()*sizeof(float));
+
+        char iter_name[128];
+        snprintf(iter_name, sizeof(iter_name), "%s iter=%d", name, iter);
+        if (!check_output(iter_name, out, data.reference)) {
+            ok = false;
+            break;
+        }
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(gc.ctx);
+    return ok;
+}
+
 bool run_cuda_graph_replay_case(const char * name, ggml_backend_t backend, ggml_type type,
         int64_t k, int64_t m, int64_t n_slots, int64_t n_used) {
     set_slot_mmvq_env(true);
+    set_prefill_mmvq_env(false);
     set_slot_graphs_env(true);
 
     graph_case gc = build_case(type, k, m, n_slots, n_used, 1);
@@ -428,6 +497,7 @@ bool set_glu_case_tensors(const char * name, const glu_graph_case & gc, const gl
 bool compute_glu_output(const char * name, ggml_backend_t backend, const glu_graph_case & gc,
         const glu_tensor_data & data, bool enable_glu_fusion, bool enable_graphs, std::vector<float> & out) {
     set_slot_mmvq_env(true);
+    set_prefill_mmvq_env(false);
     set_slot_glu_fusion_env(enable_glu_fusion);
     set_slot_graphs_env(enable_graphs);
 
@@ -585,7 +655,9 @@ int main() {
     ok = run_cuda_case("decode generic sorted", backend, type, k, m, n_slots, n_used, 1, false) && ok;
     ok = run_cuda_case("decode guarded MMVQ", backend, type, k, m, n_slots, n_used, 1, true) && ok;
     ok = run_cuda_graph_replay_case("decode guarded MMVQ graphs", backend, type, k, m, n_slots, n_used) && ok;
-    ok = run_cuda_case("prefill guard fallback", backend, type, k, m, n_slots, n_used, 4, true, true) && ok;
+    ok = run_cuda_case("prefill guard fallback", backend, type, k, m, n_slots, n_used, 4, true, true, false) && ok;
+    ok = run_cuda_case("prefill guarded MMVQ", backend, type, k, m, n_slots, n_used, 4, true, false, true) && ok;
+    ok = run_cuda_prefill_replay_case("prefill guarded MMVQ replay", backend, type, k, m, n_slots, n_used, 4) && ok;
     ok = run_cuda_glu_case("decode guarded GLU unfused", backend, type, k, m, n_slots, n_used, 1, false) && ok;
     ok = run_cuda_glu_case("decode guarded GLU fusion", backend, type, k, m, n_slots, n_used, 1, true) && ok;
     ok = run_cuda_glu_graph_replay_case("decode guarded GLU fusion graphs", backend, type, k, m, n_slots, n_used) && ok;
@@ -593,6 +665,7 @@ int main() {
 
     ggml_backend_free(backend);
     set_slot_mmvq_env(false);
+    set_prefill_mmvq_env(false);
     set_slot_graphs_env(false);
     set_slot_glu_fusion_env(false);
 

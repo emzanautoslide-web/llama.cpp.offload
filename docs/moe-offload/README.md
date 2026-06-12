@@ -51,9 +51,11 @@ Set `LLAMA_MOE_SLOT_MMVQ=1` to enable the guarded CUDA `.slot` quantized
 single-token MMVQ decode fast path. Set `LLAMA_MOE_SLOT_GRAPHS=1` as well to
 enable CUDA graph capture for that same guarded decode shape. Set
 `LLAMA_MOE_SLOT_GLU_FUSION=1` to additionally enable the guarded decode-only
-`.slot` `MUL_MAT_ID + GLU` fusion path. These guards are off by default;
-MMQ/MMF, multi-token prefill fast paths, generic sorted graph capture, and CUDA
-top-k MoE fusion remain disabled for normal `.slot`/offload runs. Phase H adds
+`.slot` `MUL_MAT_ID + GLU` fusion path. Set `LLAMA_MOE_PREFILL_MMVQ=1`
+together with `LLAMA_MOE_SLOT_MMVQ=1` to enable the guarded multi-token
+`.slot` MMVQ prefill path. These guards are off by default; MMQ/MMF, prefill
+graphs/fusion, generic sorted graph capture, and CUDA top-k MoE fusion remain
+disabled for normal `.slot`/offload runs. Phase H adds
 `LLAMA_MOE_TOPK_FUSION_DIAG=1` for focused single-token decode diagnostics
 only; it is default-off because the same-build benchmark did not show a
 material TPOT or `topk_d2h_us` gain. Phase H's large prefill win came from the
@@ -125,9 +127,11 @@ Set `LLAMA_MOE_SLOT_MMVQ=1` to enable the guarded CUDA `.slot` quantized
 single-token MMVQ decode fast path. Set `LLAMA_MOE_SLOT_GRAPHS=1` as well to
 enable CUDA graph capture for that same guarded decode shape. Set
 `LLAMA_MOE_SLOT_GLU_FUSION=1` to additionally enable the guarded decode-only
-`.slot` `MUL_MAT_ID + GLU` fusion path. These guards are off by default;
-MMQ/MMF, multi-token prefill fast paths, generic sorted graph capture, and CUDA
-top-k MoE fusion remain disabled for normal `.slot`/offload runs. Phase H's
+`.slot` `MUL_MAT_ID + GLU` fusion path. Set `LLAMA_MOE_PREFILL_MMVQ=1`
+together with `LLAMA_MOE_SLOT_MMVQ=1` to enable the guarded multi-token
+`.slot` MMVQ prefill path. These guards are off by default; MMQ/MMF, prefill
+graphs/fusion, generic sorted graph capture, and CUDA top-k MoE fusion remain
+disabled for normal `.slot`/offload runs. Phase H's
 `LLAMA_MOE_TOPK_FUSION_DIAG=1` path is a diagnostic single-token decode path,
 not a recommended benchmark default. The Phase H prefill speedup is present in
 the baseline run with top-k fusion disabled because callback reads now handle
@@ -252,9 +256,10 @@ Implemented in this slice:
 - **Perf-F**: `LLAMA_MOE_SLOT_GRAPHS=1` enables CUDA graph capture only for the guarded `.slot` MMVQ decode path. On the 8000 MiB EAMC benchmark this improved TPOT from 47.20 ms/token to 30.63 ms/token versus Phase E and reduced decode `compute_us` from 24.34 ms/token to 10.46 ms/token; H2D, stall, predictor time, SSD read time, callback wall time, and hit rates were flat or better.
 - **Perf-G**: `LLAMA_MOE_SLOT_GLU_FUSION=1` enables the guarded decode-only `.slot` quantized `MUL_MAT_ID + GLU` fusion path on top of `LLAMA_MOE_SLOT_MMVQ=1`. On the 8000 MiB EAMC benchmark this improved TPOT from 31.56 ms/token to 30.67 ms/token versus the Phase F guard stack in the same build and reduced callback wall time from 17.78 ms/token to 17.06 ms/token; `gpu_compute` was effectively flat at 10.44 to 10.37 ms/token and H2D, hit rate, misses/token, and top-k D2H stayed flat.
 - **Perf-H**: Phase H fixed callback reads of strided top-k views by using `ggml_backend_tensor_get_2d()` when the top-k tensor is a non-contiguous view. This is on the default path and explains the large prefill jump: versus the Phase G GLU run, Phase H baseline prefill improved from 14021.9 ms to 5070.4 ms, average experts observed per prefill callback fell from 64.0 to about 20.7, prefill misses fell from 44581 to 11610, and prefill callback wall time fell from 23467 ms to 6498 ms. Separately, `LLAMA_MOE_TOPK_FUSION_DIAG=1` enables an opt-in diagnostic single-token decode top-k MoE fusion path. Phase H fixed the earlier top-k golden-logit failure by moving the streaming callback point from `ffn_moe_topk` to final routing weights while still reading IDs from the original top-k tensor. Synthetic routing, golden logits, and chat smoke passed, including the full MMVQ + graphs + GLU stack, but the 8000 MiB same-build EAMC top-k-fusion benchmark was flat: TPOT 31.91 to 31.88 ms/token and `topk_d2h_us` 1.58 to 1.58 ms/token. Keep top-k fusion default-off.
+- **Perf-I**: `LLAMA_MOE_PREFILL_MMVQ=1`, used together with `LLAMA_MOE_SLOT_MMVQ=1`, enables the guarded multi-token `.slot` MMVQ prefill path. Synthetic CUDA coverage now checks the multi-token path with changing slot IDs and changed slot tensor contents, and the guarded stack passed raw golden logits (`max|d|=0`) plus `llama-cli --jinja --reasoning off` chat smoke at the default ubatch and forced `LLAMA_MOE_STREAMING_UBATCH=8`. In the 8000 MiB EAMC same-build benchmark it improved TTFT from 6505.2 ms to 6202.5 ms, but decode TPOT regressed from 36.72 ms/token to 40.85 ms/token, so the guard remains experimental and default-off.
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
 - **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke, the Phase E/F `test-slot-mmvq` CUDA micro-test, and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
-- **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. By default CUDA `MUL_MAT_ID` on `.slot` tensors uses the generic sorted path for correctness-first validation. The guarded decode-only MMVQ path is available through `LLAMA_MOE_SLOT_MMVQ=1`, with decode-only CUDA graphs additionally gated by `LLAMA_MOE_SLOT_GRAPHS=1`, decode-only GLU fusion gated by `LLAMA_MOE_SLOT_GLU_FUSION=1`, and diagnostic-only decode top-k fusion gated by `LLAMA_MOE_TOPK_FUSION_DIAG=1`; MMQ/MMF, multi-token prefill fast paths, generic sorted graph capture, and normal top-k MoE fusion remain disabled for `.slot`/offload.
+- **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. By default CUDA `MUL_MAT_ID` on `.slot` tensors uses the generic sorted path for correctness-first validation. The guarded decode-only MMVQ path is available through `LLAMA_MOE_SLOT_MMVQ=1`, with decode-only CUDA graphs additionally gated by `LLAMA_MOE_SLOT_GRAPHS=1`, decode-only GLU fusion gated by `LLAMA_MOE_SLOT_GLU_FUSION=1`, guarded multi-token MMVQ prefill gated by `LLAMA_MOE_PREFILL_MMVQ=1`, and diagnostic-only decode top-k fusion gated by `LLAMA_MOE_TOPK_FUSION_DIAG=1`; MMQ/MMF, prefill graphs/fusion, generic sorted graph capture, and normal top-k MoE fusion remain disabled for `.slot`/offload.
 - **L**: IO worker shutdown wired into `llama_context::~llama_context()`; small-cache and multi-token-prompt streaming deadlocks fixed by excluding just-reserved experts from LRU/predictor eviction within the same callback. Larger-ubatch miss loading now submits and drains I/O in chunks instead of requiring the pinned-buffer pool to cover every blob for the layer.
 
 ## Correctness
@@ -349,7 +354,7 @@ CTest targets under label `moe-offload`:
 | Test | Phase | Purpose |
 |---|---|---|
 | `test-cuda-stream` | G | Pinned alloc + async H2D + event ordering smoke. |
-| `test-slot-mmvq` | Perf-E/F/G | Synthetic CUDA `.slot` Q4_0 `MUL_MAT_ID` check for generic sorted decode, guarded MMVQ decode, guarded MMVQ graph replay with changing slot ids/contents, guarded decode-only GLU fusion replay, and guarded prefill fallback. Registered only when the CUDA backend target is available. |
+| `test-slot-mmvq` | Perf-E/F/G/I | Synthetic CUDA `.slot` Q4_0 `MUL_MAT_ID` check for generic sorted decode, guarded MMVQ decode, guarded MMVQ graph replay with changing slot ids/contents, guarded prefill MMVQ with changing slot ids/contents, guarded decode-only GLU fusion replay, and guarded prefill graph/fusion fallback. Registered only when the CUDA backend target is available. |
 | `test-topk-moe-fusion` | Perf-H | Synthetic CUDA Qwen-style router check for unfused vs diagnostic fused `softmax -> argsort_top_k -> get_rows -> norm -> scale`, including single-token decode and multi-token fallback. Registered only when the CUDA backend target is available. |
 | `test-eamc-cosine` | K / Perf-B / Perf-C | EAMC dense-equivalent scoring, sidecar round-trip, prefill-like repeated layer waves, and bounded FIFO/ring replacement on full insert. |
 | `test-lru-eviction` | K | Hand-computed LRU score values, victim ordering, per-layer isolation. |
@@ -409,7 +414,8 @@ $env:LLAMA_MOE_MIN_SLOTS="8"           # override the minimum working set
 The old fixed-cap workaround targeted an older remap path. Current streaming
 uses callback-filled slot-id tensors and generic `.slot` `MUL_MAT_ID` by
 default. The guarded `LLAMA_MOE_SLOT_MMVQ=1` path restores only quantized
-single-token MMVQ decode.
+single-token MMVQ decode unless `LLAMA_MOE_PREFILL_MMVQ=1` is also set for the
+guarded multi-token prefill path.
 Large-ubatch failures should now surface as `n_uniq exceeds n_slots` or an I/O
 progress error; a CUDA illegal access is a regression and should be captured
 with the cache size, effective ubatch, and prompt.

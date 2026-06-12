@@ -113,6 +113,11 @@ static bool ggml_cuda_moe_slot_mmvq_enabled() {
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+static bool ggml_cuda_moe_prefill_mmvq_enabled() {
+    const char * env = getenv("LLAMA_MOE_PREFILL_MMVQ");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 static bool ggml_cuda_moe_slot_graphs_enabled() {
     const char * env = getenv("LLAMA_MOE_SLOT_GRAPHS");
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
@@ -2740,7 +2745,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool moe_slot_tensor = ggml_cuda_is_moe_slot_tensor(src0);
     const bool use_moe_slot_mmvq = moe_slot_tensor && ggml_cuda_moe_slot_mmvq_enabled() &&
-        ggml_is_quantized(src0->type) && ne2 == 1;
+        ggml_is_quantized(src0->type) &&
+        (ne2 == 1 || (ne2 > 1 && ggml_cuda_moe_prefill_mmvq_enabled()));
     const bool use_specialized_mul_mat_id = !moe_slot_tensor || use_moe_slot_mmvq;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -2762,8 +2768,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (moe_slot_tensor) {
-            // Phase E only restores guarded quantized single-token MMVQ for slot tensors.
-            // MMQ/MMF, multi-token prefill, and fusion remain separate validation steps.
+            // Slot MMVQ is guarded separately for decode and multi-token prefill.
+            // MMQ/MMF and broader fusion remain separate validation steps.
             GGML_ASSERT(use_moe_slot_mmvq);
         } else {
             if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
