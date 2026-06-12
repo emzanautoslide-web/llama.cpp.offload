@@ -1,10 +1,10 @@
 # MoE Offload Known Issues
 
-Status as of the guarded Phase J calibration on 2026-06-12.
+Status as of the guarded Phase K closeout on 2026-06-12.
 
 ## Open
 
-### Batched Streaming Chat Prefill Is Not Yet Safe
+### Batched Streaming Chat Prefill Remains Conservative By Default
 
 `llama-cli --moe-offload` produced wrong visible answers for simple chat
 prompts such as `who are you?`, `what is the capital of France?`, and
@@ -22,21 +22,21 @@ Current status:
   final answer.
 - Async-H2D diagnostics, forced no-hit reloads, identity slot-table fill, and
   compute synchronization diagnostics did not fix the chat issue.
-- Raw-completion golden-logit gates have passed at larger ubatches, including
-  the Phase I `LLAMA_MOE_SLOT_MMVQ=1` + `LLAMA_MOE_PREFILL_MMVQ=1` +
-  `LLAMA_MOE_SLOT_GRAPHS=1` + `LLAMA_MOE_SLOT_GLU_FUSION=1` gate. The Phase I
-  formatted chat smoke also passed at the default ubatch and forced
-  `LLAMA_MOE_STREAMING_UBATCH=8`, but the historical failures were prompt- and
-  frontend-sensitive, so the interactive default remains ubatch 1 until the
-  broader Phase K matrix is rerun.
+- Phase K reran the raw-completion golden-logit matrix with the accepted guard
+  stack (`LLAMA_MOE_SLOT_MMVQ=1`, `LLAMA_MOE_SLOT_GRAPHS=1`,
+  `LLAMA_MOE_SLOT_GLU_FUSION=1`, `LLAMA_MOE_PREFILL_MMVQ=0`,
+  `LLAMA_MOE_TOPK_FUSION_DIAG=0`). All 12 cache/ubatch cases passed with
+  `max|d|=0`: cache 4000, 8000, and 12000 MiB crossed with ubatch 8, 16, 32,
+  and 64.
+- Phase K formatted `llama-cli --jinja --reasoning off` chat smoke passed at
+  the default ubatch and forced `LLAMA_MOE_STREAMING_UBATCH=8`.
 
 Mitigation:
 
-- Do not raise the `llama-cli --moe-offload` default above ubatch 1 until the
-  formatted-chat smoke and golden-logit matrix pass at larger streaming
-  ubatches.
-- Benchmark and diagnostic tools may still force larger ubatches while this is
-  investigated.
+- The broader Phase K gate passed, but the interactive default remains ubatch 1
+  for now because historical failures were prompt- and frontend-sensitive.
+- Benchmark and diagnostic tools may force larger ubatches; rerun the
+  formatted-chat smoke when changing the accepted guard stack or chat frontend.
 
 ## Current Limits And Caveats
 
@@ -170,6 +170,11 @@ Current status:
   practical budget for effective ubatch 16, 14000 MiB is only slightly faster
   and nearly fills VRAM, and 16000 MiB over-pressures VRAM and regresses decode
   TPOT badly.
+- Phase K closeout passed the accepted guard stack through CTest, golden-logit
+  matrix, default chat smoke, and forced ubatch 8 chat smoke. The final
+  12000 MiB EAMC benchmark measured TTFT cold 4398.2 ms, TPOT
+  26.78 ms/token, prefill `gpu_compute` 7.49 ms/token, decode `gpu_compute`
+  11.16 ms/token, and peak VRAM 14.08 / 15.92 GB.
 - `.slot` MMQ/MMF, prefill graphs/fusion, generic sorted graph capture, normal
   top-k fusion, and non-GLU fusion remain bypassed or disabled until
   separately validated.
@@ -340,6 +345,13 @@ sorted CUDA, but the guarded paths passed:
 - golden-logit gate with `max|d|=0`,
 - `llama-cli` chat smoke,
 - 8000 MiB EAMC benchmark with faster TTFT and TPOT.
+
+### Static CUDA `test-cuda-stream` Link Rule
+
+Phase K fixed the static Windows CUDA test link rule so `test-cuda-stream`
+does not link both dynamic `cudart.lib` and `cudart_static.lib`. The target now
+uses CUDA headers directly and avoids adding dynamic `CUDA::cudart` when
+`GGML_STATIC` is enabled on Windows.
 
 ### Oracle Ambiguity
 

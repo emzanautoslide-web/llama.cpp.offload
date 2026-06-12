@@ -290,6 +290,7 @@ Implemented in this slice:
 - **Perf-H**: Phase H fixed callback reads of strided top-k views by using `ggml_backend_tensor_get_2d()` when the top-k tensor is a non-contiguous view. This is on the default path and explains the large prefill jump: versus the Phase G GLU run, Phase H baseline prefill improved from 14021.9 ms to 5070.4 ms, average experts observed per prefill callback fell from 64.0 to about 20.7, prefill misses fell from 44581 to 11610, and prefill callback wall time fell from 23467 ms to 6498 ms. Separately, `LLAMA_MOE_TOPK_FUSION_DIAG=1` enables an opt-in diagnostic single-token decode top-k MoE fusion path. Phase H fixed the earlier top-k golden-logit failure by moving the streaming callback point from `ffn_moe_topk` to final routing weights while still reading IDs from the original top-k tensor. Synthetic routing, golden logits, and chat smoke passed, including the full MMVQ + graphs + GLU stack, but the 8000 MiB same-build EAMC top-k-fusion benchmark was flat: TPOT 31.91 to 31.88 ms/token and `topk_d2h_us` 1.58 to 1.58 ms/token. Keep top-k fusion default-off.
 - **Perf-I**: `LLAMA_MOE_PREFILL_MMVQ=1`, used together with `LLAMA_MOE_SLOT_MMVQ=1`, enables the guarded multi-token `.slot` MMVQ prefill path. Synthetic CUDA coverage now checks the multi-token path with changing slot IDs and changed slot tensor contents, and the guarded stack passed raw golden logits (`max|d|=0`) plus `llama-cli --jinja --reasoning off` chat smoke at the default ubatch and forced `LLAMA_MOE_STREAMING_UBATCH=8`. In the 8000 MiB EAMC same-build benchmark it improved TTFT from 6505.2 ms to 6202.5 ms, but decode TPOT regressed from 36.72 ms/token to 40.85 ms/token, so the guard remains experimental and default-off.
 - **Perf-J**: `llama-moe-bench` now reports cold and warm TTFT separately, emits prefill I/O/profiler breakdowns alongside decode, and supports `--moe-reset-cache-between-repeats`, `--moe-warm-cache`, and benchmark-only `--moe-hot-start`. On the 16 GiB dev box, the cache matrix showed 8000 MiB reaches effective ubatch 8, 12000 MiB reaches effective ubatch 16 with a clear TTFT/TPOT improvement, 14000 MiB is slightly faster but nearly fills VRAM, and 16000 MiB over-pressures VRAM and badly regresses decode. Hot-start is mechanically wired but remains experimental/default-off because the smoke run worsened TTFT.
+- **Perf-K closeout**: Static CUDA validation passed `ctest --test-dir build-moe-static -C Release -L moe-offload --output-on-failure` with 8/8 tests passing. The accepted guard stack (`LLAMA_MOE_SLOT_MMVQ=1`, `LLAMA_MOE_SLOT_GRAPHS=1`, `LLAMA_MOE_SLOT_GLU_FUSION=1`, `LLAMA_MOE_PREFILL_MMVQ=0`, `LLAMA_MOE_TOPK_FUSION_DIAG=0`) passed the golden-logit gate at cache 4000 MiB, `-ub 8`, `max|d|=0`, and the full cache/ubatch matrix for 4000/8000/12000 MiB x 8/16/32/64 also passed with `max|d|=0`. `llama-cli --jinja --reasoning off` chat smoke passed at the default ubatch and forced `LLAMA_MOE_STREAMING_UBATCH=8`. The final 12000 MiB EAMC benchmark measured TTFT cold 4398.2 ms, TPOT 26.78 ms/token, prefill `gpu_compute` 7.49 ms/token, decode `gpu_compute` 11.16 ms/token, and peak VRAM 14.08 / 15.92 GB.
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
 - **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke, the Phase E/F `test-slot-mmvq` CUDA micro-test, and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
 - **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. By default CUDA `MUL_MAT_ID` on `.slot` tensors uses the generic sorted path for correctness-first validation. The guarded decode-only MMVQ path is available through `LLAMA_MOE_SLOT_MMVQ=1`, with decode-only CUDA graphs additionally gated by `LLAMA_MOE_SLOT_GRAPHS=1`, decode-only GLU fusion gated by `LLAMA_MOE_SLOT_GLU_FUSION=1`, guarded multi-token MMVQ prefill gated by `LLAMA_MOE_PREFILL_MMVQ=1`, and diagnostic-only decode top-k fusion gated by `LLAMA_MOE_TOPK_FUSION_DIAG=1`; MMQ/MMF, prefill graphs/fusion, generic sorted graph capture, and normal top-k MoE fusion remain disabled for `.slot`/offload.
@@ -316,33 +317,23 @@ n_experts=256 — forces eviction every layer). `tests/moe-offload/compare_logit
 then mmaps both binary dumps and reports `max|Δlogit|` / `mean|Δlogit|`.
 Exit 0 iff `max|Δlogit| < --tol`.
 
-Observed on the dev box (2026-05-28, Qwen3.5-35B-A3B-Q4_K_M, prompt
-`"Hello"`, `--temp 0 --seed 42 -n 8`, 12000 MiB streaming cache,
-n_slots=145, hits=630 misses=970):
+Observed in the Phase K closeout on the dev box (2026-06-12,
+Qwen3.5-35B-A3B-Q4_K_M, prompt `"Hello"`, `--temp 0 --seed 42 -n 8`,
+accepted Perf guard stack, 4000 MiB streaming cache, `-ub 8`):
 
 | Metric | Value |
 |---|---|
 | `n_steps` | 8 |
 | `n_vocab` | 248320 |
-| `max|Δlogit|` | **4.64e-01** |
-| `mean|Δlogit|` | 3.67e-02 |
+| `max|Δlogit|` | **0** |
+| `mean|Δlogit|` | 0 |
 | `tol` | 1e-3 |
-| Result | **FAIL** (drift first observed at step 3) |
+| Result | **PASS** |
 
-The drift is real — the gate is doing its job. Streaming-mode top-1 tokens
-still match full-residency for the first 8 decodes at temp=0 (per Phase H/I
-text-equivalence smoke), but the full softmax row is not bit-equivalent.
-Root cause is not yet pinned down; Phase J anticipated a stale
-`topk → slot_table` registration on a rebuild path
-(`reset_graph_state()` now also fires in `llama_context::graph_reserve()`),
-but that alone did not move the measured drift. Remaining hypotheses:
-
-- A slot whose contents are replaced between the eval callback finishing
-  H2D and the mul_mat_id consuming the row (eviction/wait ordering bug
-  in `slot_pool::moe_eval_callback`).
-- An expert whose slot_table entry is set by a later layer's callback
-  before the current layer's mul_mat_id runs (callback ordering vs.
-  scheduler topology).
+The Phase K ubatch matrix also passed 12/12 cases with `max|Δlogit| = 0`:
+streaming cache 4000, 8000, and 12000 MiB crossed with `-ub` 8, 16, 32, and
+64. The matrix artifact is
+`tests/moe-offload/_out/phase-k-ubatch-matrix/summary.csv`.
 
 The June 5 closeout changes addressed the two leading runtime suspects from
 this section: slot tensors now use the actual cache slot count by default, and
@@ -370,15 +361,8 @@ Deviations from the source plan (`implementation_plan_mvp_20260529.md` §3):
   streaming hangs (same buffer-pool starvation) are also fixed by the
   Phase L bump. Re-tested with prompt `"The quick brown fox"` at
   cache=12000, `-n 4`: prefill + decode complete cleanly.
-- Phase J's measured drift number (`max|Δlogit|=4.64e-01`) was captured
-  on the build that produced the first `"Hello, I am a 20 year"` smoke.
-  Subsequent regressions on the same HEAD have made full-residency
-  itself crash with `GGML_ASSERT(buf != NULL && "tensor buffer not set")`
-  inside `prefetch_all_experts`; this regression is pre-existing
-  relative to Phase L (confirmed by `git stash` baseline) and prevents
-  the harness from regenerating the reference dump. Root-causing this
-  regression is on the post-MVP list; the Phase J drift number stays in
-  the table above as the last good measurement.
+- Historical Phase J drift (`max|Δlogit|=4.64e-01`) is closed by the later
+  runtime/CUDA correctness fixes and Phase K revalidation.
 
 ## Test surface
 
