@@ -1061,6 +1061,15 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
     load_stats layer_load_stats;
     int misses_loaded = 0;
+    predictor_score_stats pred_stats;
+
+    auto add_pred_stats = [](predictor_score_stats & dst, const predictor_score_stats & src) {
+        dst.eamc_rows_scored += src.eamc_rows_scored;
+        dst.eamc_cosine_us += src.eamc_cosine_us;
+        dst.eamc_score_materialize_us += src.eamc_score_materialize_us;
+        dst.eamc_score_cache_hits += src.eamc_score_cache_hits;
+        dst.eamc_score_cache_misses += src.eamc_score_cache_misses;
+    };
 
     // Phase H: per-miss bookkeeping needed when the worker completion comes
     // back out of submission order. We carry the slot tensor pointer (so the
@@ -1134,6 +1143,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             }
             const auto pred_end = std::chrono::steady_clock::now();
             pred_score_us += elapsed_us(pred_start, pred_end);
+            add_pred_stats(pred_stats, s.pred->take_score_stats());
             if (best_victim < 0) {
                 // Fall back to LRU tail, but still skip reserved-this-call.
                 for (auto it = lc.lru.rbegin(); it != lc.lru.rend(); ++it) {
@@ -1453,6 +1463,11 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         p.row.pred_observe_us = pred_observe_us;
         p.row.pred_score_us = pred_score_us;
         p.row.pred_us = pred_observe_us + pred_score_us;
+        p.row.eamc_rows_scored = pred_stats.eamc_rows_scored;
+        p.row.eamc_cosine_us = pred_stats.eamc_cosine_us;
+        p.row.eamc_score_materialize_us = pred_stats.eamc_score_materialize_us;
+        p.row.eamc_score_cache_hits = pred_stats.eamc_score_cache_hits;
+        p.row.eamc_score_cache_misses = pred_stats.eamc_score_cache_misses;
         p.row.topk_d2h_us = topk_d2h_us;
         p.row.slot_ids_h2d_us = slot_ids_h2d_us;
         p.row.slot_table_h2d_us = slot_table_h2d_us;

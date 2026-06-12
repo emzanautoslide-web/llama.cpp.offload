@@ -29,6 +29,11 @@ struct profile_row {
     int64_t topk_d2h_us = 0;
     int64_t slot_ids_h2d_us = 0;
     int64_t slot_table_h2d_us = 0;
+    uint64_t eamc_rows_scored = 0;
+    int64_t eamc_cosine_us = 0;
+    int64_t eamc_score_materialize_us = 0;
+    uint64_t eamc_score_cache_hits = 0;
+    uint64_t eamc_score_cache_misses = 0;
     uint64_t ssd_bytes = 0;
     uint64_t ssd_reads = 0;
     int cache_resident_experts = 0;
@@ -67,6 +72,11 @@ struct profile_phase_stats {
     int64_t topk_d2h_us = 0;
     int64_t slot_ids_h2d_us = 0;
     int64_t slot_table_h2d_us = 0;
+    uint64_t eamc_rows_scored = 0;
+    int64_t eamc_cosine_us = 0;
+    int64_t eamc_score_materialize_us = 0;
+    uint64_t eamc_score_cache_hits = 0;
+    uint64_t eamc_score_cache_misses = 0;
     int64_t request_wall_us = 0;
     int64_t request_end_us = 0;
     int64_t predictor_end_us = 0;

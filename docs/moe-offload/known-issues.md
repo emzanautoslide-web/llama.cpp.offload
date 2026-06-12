@@ -246,13 +246,14 @@ round-trip and bounded FIFO/ring replacement.
 
 ### EAMC Predictor Overhead
 
-EAMC scoring now caches the nearest-neighbor ranking within a callback, so
-eviction candidate scans do not recompute the full cosine ranking repeatedly.
 Phase B removed the hidden per-token sidecar save and quadratic full-corpus
-redundancy pruning from the decode hot path. EAMC scoring is still expensive:
-the 256 prefill + 256 decode, 3-repeat Phase B run measured about
-90.54 ms/token in decode predictor scoring, so sparse/incremental EAMC scoring
-remains post-Phase-B work.
+redundancy pruning from the decode hot path. Phase C then moved EAMC scoring to
+sparse in-memory rows, an inverted `(layer, expert)` index for uncapped
+dense-equivalent cosine scoring, and lazy per-callback score-vector
+materialization. The 8000 MiB, 256 prefill + 256 decode, 3-repeat Phase C run
+reduced decode predictor scoring from the Phase B 90.54 ms/token measurement
+to about 2.52 ms/token. Row caps via `LLAMA_MOE_EAMC_ROWS=N` remain
+diagnostic-only until hit-rate gates pass on an identical starting sidecar.
 
 ### Oracle Ambiguity
 

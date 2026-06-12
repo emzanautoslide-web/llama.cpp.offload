@@ -71,7 +71,10 @@ EAMC predictor sidecar; when omitted with `--moe-predictor eamc`, the runtime
 uses the model path with a `.eamc` suffix. EAMC updates remain online during
 inference, but sidecar persistence is deferred: the hot path updates the
 in-memory corpus and saves the sidecar only at explicit benchmark end or
-context/session teardown. `--moe-profile-csv PATH` and
+context/session teardown. EAMC scoring uses sparse in-memory activation rows,
+an indexed cosine pass, and lazy per-callback score materialization. The default
+path scores the full corpus; `LLAMA_MOE_EAMC_ROWS=N` is diagnostic-only and
+must be hit-rate gated before becoming a default. `--moe-profile-csv PATH` and
 `--moe-profile-summary PATH` write profiling data.
 
 In streaming mode (`n_slots < n_experts`), the runtime auto-sizes the effective
@@ -132,6 +135,29 @@ I/O breakdown (decode, mean per token):
   stall (overlap loss)     29.30 ms
   predictor          0.04 ms
 
+Profiler breakdown (decode, mean per token):
+  predictor_observe     0.00 ms
+  predictor_score       0.04 ms
+  callback_wall        31.00 ms
+  topk_d2h              1.80 ms
+  slot_ids_h2d          0.30 ms
+  slot_table_h2d        0.00 ms
+  eamc_cosine           0.03 ms
+  eamc_materialize      0.00 ms
+  eamc_rows_scored    256.0 rows/token
+  eamc_cache_hits       8.00 hits/token
+  eamc_cache_misses     1.00 misses/token
+  request_end           0.10 ms
+  predictor_end         0.00 ms
+  predictor_save        0.00 ms
+  profile_flush         0.02 ms
+  sidecar_written       0.00 MB/token
+
+Wall/profile reconciliation (decode):
+  wall_decode_us        29622600
+  profiled_decode_us    30012000
+  unattributed_decode_us -389400
+
 VRAM peak: 14.80 GB / 15.92 GB  (experts budget: 7.81 GB, other model/kv/compute: 6.99 GB)
 DRAM peak (process): 1.40 GB
 SSD reads: 18234 (avg 0.19 MB each, avg latency 1.18 ms)
@@ -163,6 +189,11 @@ CSV columns:
 | `topk_d2h_us` | Host time spent reading top-k expert ids from the backend tensor. |
 | `slot_ids_h2d_us` | Host time spent writing remapped slot ids. |
 | `slot_table_h2d_us` | Host time spent writing the legacy slot-table path when used. |
+| `eamc_rows_scored` | EAMC corpus rows considered while computing nearest-neighbor scores for this callback. Zero for non-EAMC predictors or callbacks that do not score. |
+| `eamc_cosine_us` | Host microseconds spent computing EAMC nearest-neighbor cosine scores. |
+| `eamc_score_materialize_us` | Host microseconds spent materializing the per-layer EAMC score vector after nearest-neighbor scoring. |
+| `eamc_score_cache_hits` | Count of EAMC score-vector cache hits within eviction candidate scoring. |
+| `eamc_score_cache_misses` | Count of EAMC score-vector materializations within eviction candidate scoring. |
 | `cache_resident_experts` | Number of experts resident for the layer after miss handling. |
 | `predictor` | `lru` or `eamc`. |
 | `request_wall_us` | Request-row wall time for the internal `llama_decode()` batch. |
@@ -191,6 +222,7 @@ Implemented in this slice:
 - **H**: Eval-callback rewired to async H2D via `io_h2d_async_timed` + `io_compute_wait` (`cudaStreamWaitEvent` on the compute stream). Synchronous double-read of the miss blob removed.
 - **I**: Real `compute_us` via CUDA events. Profile rows are buffered per `llama_decode` batch and flushed at `slot_pool_end_request()` after `cudaEventElapsedTime` queries. Per-miss `h2d_us` now comes from event timing on the async path.
 - **Perf-B**: EAMC remains online in DRAM, but per-token sidecar saves were removed. Full-capacity EAMC uses FIFO/ring replacement instead of quadratic redundancy pruning; sidecars are saved at benchmark end or context/session teardown.
+- **Perf-C**: EAMC scoring uses sparse corpus rows, an inverted `(layer, expert)` index for dense-equivalent uncapped cosine scoring, lazy per-callback score-vector materialization, and profiler counters for cosine/materialization/cache activity. Corpus row caps remain diagnostic-only through `LLAMA_MOE_EAMC_ROWS=N`.
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
 - **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
 - **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. CUDA `MUL_MAT_ID` on `.slot` tensors bypasses the specialized MMVQ/MMQ/MMF paths and uses the generic sorted path for correctness-first validation.
@@ -281,7 +313,7 @@ CTest targets under label `moe-offload`:
 | Test | Phase | Purpose |
 |---|---|---|
 | `test-cuda-stream` | G | Pinned alloc + async H2D + event ordering smoke. |
-| `test-eamc-cosine` | K / Perf-B | EAMC cosine ordering, sidecar round-trip, and bounded FIFO/ring replacement on full insert. |
+| `test-eamc-cosine` | K / Perf-B / Perf-C | EAMC dense-equivalent scoring, sidecar round-trip, prefill-like repeated layer waves, and bounded FIFO/ring replacement on full insert. |
 | `test-lru-eviction` | K | Hand-computed LRU score values, victim ordering, per-layer isolation. |
 | `test-manifest-roundtrip` | K | GGUF manifest sanity (version=2, table size, per-record file ranges). Self-skips with exit 0 when `LLAMA_MOE_TEST_GGUF` is unset. |
 | `test-repack-slices` | MVP closeout | Byte-level original-vs-repacked expert slice verification. Self-skips unless `LLAMA_MOE_TEST_ORIGINAL_GGUF` and `LLAMA_MOE_TEST_GGUF` are set. |

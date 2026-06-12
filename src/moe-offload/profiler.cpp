@@ -76,6 +76,11 @@ void profiler::record(const profile_row & row) {
     stats.topk_d2h_us += row.topk_d2h_us;
     stats.slot_ids_h2d_us += row.slot_ids_h2d_us;
     stats.slot_table_h2d_us += row.slot_table_h2d_us;
+    stats.eamc_rows_scored += row.eamc_rows_scored;
+    stats.eamc_cosine_us += row.eamc_cosine_us;
+    stats.eamc_score_materialize_us += row.eamc_score_materialize_us;
+    stats.eamc_score_cache_hits += row.eamc_score_cache_hits;
+    stats.eamc_score_cache_misses += row.eamc_score_cache_misses;
     if (row.cache_resident_experts > stats.cache_resident_peak) {
         stats.cache_resident_peak = row.cache_resident_experts;
     }
@@ -102,6 +107,11 @@ void profiler::record(const profile_row & row) {
             << row.topk_d2h_us << ','
             << row.slot_ids_h2d_us << ','
             << row.slot_table_h2d_us << ','
+            << row.eamc_rows_scored << ','
+            << row.eamc_cosine_us << ','
+            << row.eamc_score_materialize_us << ','
+            << row.eamc_score_cache_hits << ','
+            << row.eamc_score_cache_misses << ','
             << row.cache_resident_experts << ','
             << row.predictor << ','
             << 0 << ','
@@ -131,6 +141,11 @@ void profiler::record_request(const profile_request_row & row) {
             << 0 << ','
             << row.phase << ','
             << -1 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
+            << 0 << ','
             << 0 << ','
             << 0 << ','
             << 0 << ','
@@ -194,6 +209,11 @@ std::string profiler::summary() const {
     out << "topk_d2h_us: " << stats.topk_d2h_us << '\n';
     out << "slot_ids_h2d_us: " << stats.slot_ids_h2d_us << '\n';
     out << "slot_table_h2d_us: " << stats.slot_table_h2d_us << '\n';
+    out << "eamc_rows_scored: " << stats.eamc_rows_scored << '\n';
+    out << "eamc_cosine_us: " << stats.eamc_cosine_us << '\n';
+    out << "eamc_score_materialize_us: " << stats.eamc_score_materialize_us << '\n';
+    out << "eamc_score_cache_hits: " << stats.eamc_score_cache_hits << '\n';
+    out << "eamc_score_cache_misses: " << stats.eamc_score_cache_misses << '\n';
     out << "request_wall_us: " << stats.request_wall_us << '\n';
     out << "request_end_us: " << stats.request_end_us << '\n';
     out << "predictor_end_us: " << stats.predictor_end_us << '\n';
@@ -298,6 +318,17 @@ std::string format_summary(
         << us_per_token_ms(profile.decode.slot_ids_h2d_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
     out << "  slot_table_h2d    " << std::setw(8)
         << us_per_token_ms(profile.decode.slot_table_h2d_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  eamc_cosine       " << std::setw(8)
+        << us_per_token_ms(profile.decode.eamc_cosine_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  eamc_materialize  " << std::setw(8)
+        << us_per_token_ms(profile.decode.eamc_score_materialize_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
+    out << "  eamc_rows_scored  " << std::setw(8) << std::setprecision(1)
+        << ((double) profile.decode.eamc_rows_scored / (double) decode_tokens_total) << " rows/token\n";
+    out << std::setprecision(2);
+    out << "  eamc_cache_hits   " << std::setw(8)
+        << ((double) profile.decode.eamc_score_cache_hits / (double) decode_tokens_total) << " hits/token\n";
+    out << "  eamc_cache_misses " << std::setw(8)
+        << ((double) profile.decode.eamc_score_cache_misses / (double) decode_tokens_total) << " misses/token\n";
     out << "  request_end       " << std::setw(8)
         << us_per_token_ms(profile.decode.request_end_us, ctx.n_gen, ctx.n_repeat) << " ms\n";
     out << "  predictor_end     " << std::setw(8)
@@ -347,6 +378,11 @@ profile_phase_stats profiler::total() const {
     stats.topk_d2h_us = prefill_stats.topk_d2h_us + decode_stats.topk_d2h_us;
     stats.slot_ids_h2d_us = prefill_stats.slot_ids_h2d_us + decode_stats.slot_ids_h2d_us;
     stats.slot_table_h2d_us = prefill_stats.slot_table_h2d_us + decode_stats.slot_table_h2d_us;
+    stats.eamc_rows_scored = prefill_stats.eamc_rows_scored + decode_stats.eamc_rows_scored;
+    stats.eamc_cosine_us = prefill_stats.eamc_cosine_us + decode_stats.eamc_cosine_us;
+    stats.eamc_score_materialize_us = prefill_stats.eamc_score_materialize_us + decode_stats.eamc_score_materialize_us;
+    stats.eamc_score_cache_hits = prefill_stats.eamc_score_cache_hits + decode_stats.eamc_score_cache_hits;
+    stats.eamc_score_cache_misses = prefill_stats.eamc_score_cache_misses + decode_stats.eamc_score_cache_misses;
     stats.request_wall_us = prefill_stats.request_wall_us + decode_stats.request_wall_us;
     stats.request_end_us = prefill_stats.request_end_us + decode_stats.request_end_us;
     stats.predictor_end_us = prefill_stats.predictor_end_us + decode_stats.predictor_end_us;
@@ -361,7 +397,7 @@ profile_phase_stats profiler::total() const {
 }
 
 void profiler::write_header() {
-    csv << "row_type,request_idx,repeat_idx,batch_idx,token_idx,phase,layer,k_required,k_hit,k_miss,ssd_read_us,h2d_us,compute_us,stall_us,pred_us,pred_observe_us,pred_score_us,callback_wall_us,topk_d2h_us,slot_ids_h2d_us,slot_table_h2d_us,cache_resident_experts,predictor,request_wall_us,request_end_us,predictor_end_us,predictor_save_us,profile_flush_us,sidecar_write_bytes\n";
+    csv << "row_type,request_idx,repeat_idx,batch_idx,token_idx,phase,layer,k_required,k_hit,k_miss,ssd_read_us,h2d_us,compute_us,stall_us,pred_us,pred_observe_us,pred_score_us,callback_wall_us,topk_d2h_us,slot_ids_h2d_us,slot_table_h2d_us,eamc_rows_scored,eamc_cosine_us,eamc_score_materialize_us,eamc_score_cache_hits,eamc_score_cache_misses,cache_resident_experts,predictor,request_wall_us,request_end_us,predictor_end_us,predictor_save_us,profile_flush_us,sidecar_write_bytes\n";
 }
 
 } // namespace llama_moe
