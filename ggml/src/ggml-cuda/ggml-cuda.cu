@@ -118,6 +118,21 @@ static bool ggml_cuda_moe_slot_graphs_enabled() {
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+static bool ggml_cuda_moe_slot_glu_fusion_enabled() {
+    const char * env = getenv("LLAMA_MOE_SLOT_GLU_FUSION");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool ggml_cuda_moe_topk_fusion_enabled(const ggml_tensor * logits = nullptr) {
+#ifdef LLAMA_MOE_OFFLOAD
+    GGML_UNUSED(logits);
+    return false;
+#else
+    GGML_UNUSED(logits);
+    return true;
+#endif
+}
+
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
 void ggml_cuda_set_device(int device) {
@@ -135,6 +150,42 @@ int ggml_cuda_get_device() {
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
     return id;
+}
+
+static bool ggml_cuda_moe_slot_glu_fusion_tensor_compatible(const ggml_tensor * tensor) {
+    if (!ggml_cuda_moe_slot_glu_fusion_enabled() || !ggml_cuda_moe_slot_mmvq_enabled()) {
+        return false;
+    }
+
+    if (!tensor || tensor->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = tensor->src[0];
+    const ggml_tensor * src1 = tensor->src[1];
+    const ggml_tensor * ids  = tensor->src[2];
+
+    if (!src0 || !src1 || !ids || !ggml_cuda_is_moe_slot_tensor(src0)) {
+        return false;
+    }
+
+    if (!ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 ||
+            ids->type != GGML_TYPE_I32 || tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // Keep Phase G decode-only: prefill/multi-token fusion is deferred.
+    if (tensor->ne[2] != 1) {
+        return false;
+    }
+
+    if (src1->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+    return tensor->ne[2] <= mmvq_mmid_max;
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -2412,9 +2463,19 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    if (is_mul_mat_id && ggml_cuda_moe_slot_mmvq_enabled() &&
-            (ggml_cuda_is_moe_slot_tensor(ffn_up->src[0]) || ggml_cuda_is_moe_slot_tensor(ffn_gate->src[0]))) {
-        return false;
+    if (is_mul_mat_id) {
+        const bool up_slot   = ggml_cuda_is_moe_slot_tensor(ffn_up->src[0]);
+        const bool gate_slot = ggml_cuda_is_moe_slot_tensor(ffn_gate->src[0]);
+
+        if (up_slot || gate_slot) {
+            if (!up_slot || !gate_slot) {
+                return false;
+            }
+            if (!ggml_cuda_moe_slot_glu_fusion_tensor_compatible(ffn_up) ||
+                    !ggml_cuda_moe_slot_glu_fusion_tensor_compatible(ffn_gate)) {
+                return false;
+            }
+        }
     }
 
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
@@ -2489,7 +2550,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
-    if (is_mul_mat_id && ggml_cuda_moe_slot_mmvq_enabled() && ggml_cuda_is_moe_slot_tensor(src0)) {
+    if (is_mul_mat_id && ggml_cuda_is_moe_slot_tensor(src0)) {
         return false;
     }
 
@@ -2521,13 +2582,15 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool allow_moe_slot_glu = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_cuda_moe_slot_mmvq_enabled() && ggml_cuda_is_moe_slot_tensor(src0)) {
-        return false;
+    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_cuda_is_moe_slot_tensor(src0)) {
+        if (!allow_moe_slot_glu || !ggml_cuda_moe_slot_glu_fusion_tensor_compatible(tensor)) {
+            return false;
+        }
     }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
@@ -3479,13 +3542,13 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
-#ifndef LLAMA_MOE_OFFLOAD
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.softmax         = false;
     args.delayed_softmax = false;
     args.prob_bias       = false;
     args.norm            = false;
+    args.scale           = false;
 
     const int      n_nodes = cgraph->n_nodes;
     ggml_tensor ** nodes   = cgraph->nodes;
@@ -3625,7 +3688,6 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 
     return true;
 }
-#endif
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
@@ -3923,14 +3985,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     //topk-moe
-#ifndef LLAMA_MOE_OFFLOAD
-    if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
-            cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+    if (ggml_cuda_moe_topk_fusion_enabled() &&
+            (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+             cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
 
-        if (can_fuse) {
+        if (can_fuse && ggml_cuda_moe_topk_fusion_enabled(node->src[0])) {
             const ggml_tensor * logits  = node->src[0];
             ggml_tensor *       weights = nullptr;
             ggml_tensor *       ids     = nullptr;
@@ -3992,7 +4054,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
     }
-#endif
 
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
@@ -4154,7 +4215,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, /*allow_moe_slot_glu=*/ true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -4193,7 +4254,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*allow_moe_slot_glu=*/ true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);

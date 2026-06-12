@@ -90,7 +90,10 @@ CUDA top-k MoE fusion is disabled in `LLAMA_MOE_OFFLOAD` builds. During MVP
 closeout, full-cache forced-streaming diagnostics showed the same logit drift
 with and without remapped slot ids, while `GGML_CUDA_DISABLE_FUSION=1` matched
 golden logits exactly. Per-fusion isolation showed that disabling top-k MoE
-fusion alone was sufficient.
+fusion alone was sufficient. Phase G re-tested the single-row decode top-k
+fused path behind an experimental guard and it still failed the golden-logit
+gate (`max|d| = 4.639292e-01` at step 3), so `LLAMA_MOE_TOPK_FUSION=1` is
+ignored in `LLAMA_MOE_OFFLOAD` builds for now.
 
 Impact:
 
@@ -103,7 +106,9 @@ Impact:
 By default, CUDA `MUL_MAT_ID` on `.slot` tensors still uses the generic sorted
 CUDA path. Phase E added guarded quantized single-token `.slot` MMVQ decode
 with `LLAMA_MOE_SLOT_MMVQ=1`; Phase F added optional CUDA graph capture for
-that same decode shape with `LLAMA_MOE_SLOT_GRAPHS=1`.
+that same decode shape with `LLAMA_MOE_SLOT_GRAPHS=1`; Phase G added optional
+decode-only `.slot` quantized `MUL_MAT_ID + GLU` fusion with
+`LLAMA_MOE_SLOT_GLU_FUSION=1`.
 
 Current status:
 
@@ -118,8 +123,13 @@ Current status:
   and decode `compute_us` from 24.34 ms/token to 10.46 ms/token versus Phase E.
   This benchmark used the static validation build because the shared CUDA DLL
   was blocked by Windows Smart App Control.
+- The Phase G benchmark improved TPOT from 31.56 ms/token to 30.67 ms/token
+  versus the Phase F guard stack in the same static build and reduced decode
+  callback wall time from 17.78 ms/token to 17.06 ms/token. Decode
+  `gpu_compute` was effectively flat at 10.44 to 10.37 ms/token.
 - `.slot` MMQ/MMF, multi-token prefill fast paths, generic sorted graph
-  capture, and fusion remain bypassed or disabled until separately validated.
+  capture, and non-GLU fusion remain bypassed or disabled until separately
+  validated.
 
 ### EAMC Row Caps Are Diagnostic Only
 
