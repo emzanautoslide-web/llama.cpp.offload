@@ -147,16 +147,22 @@ Impact:
 - Throughput may be lower until the fused path is made safe for the MoE
   offload callback/remap flow.
 
-### Specialized `.slot` `MUL_MAT_ID` Paths Bypassed
+### Specialized `.slot` `MUL_MAT_ID` Paths Mostly Bypassed
 
-For MVP correctness, CUDA `MUL_MAT_ID` on `.slot` tensors bypasses the
-specialized MMVQ/MMQ/MMF paths and uses the generic sorted CUDA path.
+For MVP correctness, CUDA `MUL_MAT_ID` on `.slot` tensors still uses the
+generic sorted CUDA path by default. Phase E added a guarded exception:
+`LLAMA_MOE_SLOT_MMVQ=1` enables the quantized single-token `.slot` MMVQ decode
+path.
 
 Impact:
 
-- This avoids the suspect remapped-slot kernel path while golden logits are
-  enforced.
-- A safe specialized path can be restored after targeted CUDA validation.
+- The default remains correctness-first and avoids suspect remapped-slot kernel
+  paths.
+- The guarded MMVQ decode path passed the synthetic CUDA test, golden-logit
+  gate, chat smoke, and the 8000 MiB EAMC benchmark on the 2026-06-12 dev-box
+  run.
+- `.slot` MMQ/MMF, multi-token prefill fast paths, CUDA graph capture, and
+  fusion remain bypassed or disabled until separately validated.
 
 ### Profiler `stall_us` Is Approximate
 

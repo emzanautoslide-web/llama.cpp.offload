@@ -320,6 +320,10 @@ if (LLAMA_MOE_OFFLOAD)
         target_link_libraries(test-cuda-stream PRIVATE CUDA::cudart)
     endif()
 
+    if (TARGET ggml-cuda)
+        llama_build_and_test(moe-offload/test-slot-mmvq.cpp LABEL "moe-offload")
+    endif()
+
     # Phase K unit tests — see docs/implementation_plan_mvp_20260529.md §3.
     # predictor.cpp is recompiled into each predictor test exe because the
     # symbols make_predictor / lru_predictor / eamc_predictor are not

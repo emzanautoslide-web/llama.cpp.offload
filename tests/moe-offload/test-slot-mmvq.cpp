@@ -1,0 +1,254 @@
+// ===========================================================================
+// Phase E micro-test: guarded CUDA MMVQ for MoE slot-backed MUL_MAT_ID.
+//
+// The test builds a synthetic `.slot` MUL_MAT_ID graph and compares the CUDA
+// output against a CPU reference computed from the same quantized slot tensor.
+// It runs both the default generic sorted path and the guarded
+// LLAMA_MOE_SLOT_MMVQ=1 path for a decode-shaped batch. A prefill-shaped batch
+// is also checked with the guard enabled to verify it still falls back cleanly.
+// ===========================================================================
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace {
+
+struct tensor_data {
+    std::vector<uint8_t> as_quant;
+    std::vector<float>   as_float;
+    std::vector<float>   b;
+    std::vector<int32_t> ids;
+    std::vector<float>   reference;
+};
+
+struct graph_case {
+    ggml_context * ctx = nullptr;
+    ggml_tensor  * as  = nullptr;
+    ggml_tensor  * b   = nullptr;
+    ggml_tensor  * ids = nullptr;
+    ggml_tensor  * out = nullptr;
+    ggml_cgraph  * gf  = nullptr;
+};
+
+int fail(const char * msg) {
+    fprintf(stderr, "[test-slot-mmvq] FAIL: %s\n", msg);
+    return 1;
+}
+
+void set_slot_mmvq_env(bool enabled) {
+#if defined(_WIN32)
+    _putenv(enabled ? "LLAMA_MOE_SLOT_MMVQ=1" : "LLAMA_MOE_SLOT_MMVQ=0");
+#else
+    setenv("LLAMA_MOE_SLOT_MMVQ", enabled ? "1" : "0", 1);
+#endif
+}
+
+graph_case build_case(ggml_type type, int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens) {
+    const size_t tensor_count = 8;
+    ggml_init_params params = {
+        /* .mem_size = */ ggml_tensor_overhead()*tensor_count + ggml_graph_overhead(),
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+
+    graph_case gc;
+    gc.ctx = ggml_init(params);
+    if (!gc.ctx) {
+        return gc;
+    }
+
+    gc.as = ggml_new_tensor_3d(gc.ctx, type, k, m, n_slots);
+    ggml_set_name(gc.as, "phase_e.synthetic.slot");
+
+    gc.b = ggml_new_tensor_3d(gc.ctx, GGML_TYPE_F32, k, n_used, n_tokens);
+    ggml_set_name(gc.b, "phase_e.b");
+
+    gc.ids = ggml_new_tensor_2d(gc.ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_set_name(gc.ids, "phase_e.ids");
+
+    gc.out = ggml_mul_mat_id(gc.ctx, gc.as, gc.b, gc.ids);
+    ggml_set_name(gc.out, "phase_e.out");
+
+    gc.gf = ggml_new_graph(gc.ctx);
+    ggml_build_forward_expand(gc.gf, gc.out);
+
+    return gc;
+}
+
+void fill_data(tensor_data & data, ggml_type type, int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens) {
+    data.as_float.resize((size_t) k*m*n_slots);
+    data.b.resize((size_t) k*n_used*n_tokens);
+    data.ids.resize((size_t) n_used*n_tokens);
+    data.reference.assign((size_t) m*n_used*n_tokens, 0.0f);
+
+    for (int64_t slot = 0; slot < n_slots; ++slot) {
+        for (int64_t row = 0; row < m; ++row) {
+            for (int64_t col = 0; col < k; ++col) {
+                const size_t idx = (size_t) slot*k*m + (size_t) row*k + (size_t) col;
+                const int v = (int) ((idx*17 + 11*slot + 5*row + col) % 127) - 63;
+                data.as_float[idx] = (float) v / 64.0f;
+            }
+        }
+    }
+
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t used = 0; used < n_used; ++used) {
+            data.ids[(size_t) token*n_used + (size_t) used] = (int32_t) ((token*3 + used*5) % n_slots);
+            for (int64_t col = 0; col < k; ++col) {
+                const size_t idx = (size_t) token*n_used*k + (size_t) used*k + (size_t) col;
+                const int v = (int) ((idx*13 + 7*token + 3*used + col) % 97) - 48;
+                data.b[idx] = (float) v / 48.0f;
+            }
+        }
+    }
+
+    data.as_quant.resize(ggml_row_size(type, k) * (size_t) m * (size_t) n_slots);
+    std::vector<float> row((size_t) k);
+    const size_t row_size = ggml_row_size(type, k);
+    for (int64_t slot = 0; slot < n_slots; ++slot) {
+        for (int64_t row_idx = 0; row_idx < m; ++row_idx) {
+            const size_t src = (size_t) slot*k*m + (size_t) row_idx*k;
+            std::copy(data.as_float.begin() + src, data.as_float.begin() + src + k, row.begin());
+            ggml_quantize_chunk(type, row.data(), data.as_quant.data() + ((size_t) slot*m + (size_t) row_idx)*row_size,
+                    0, 1, k, nullptr);
+        }
+    }
+}
+
+bool compute_reference(tensor_data & data, ggml_type type, int64_t k, int64_t m, int64_t n_used, int64_t n_tokens) {
+    const auto * traits = ggml_get_type_traits(type);
+    if (!traits || !traits->to_float) {
+        return false;
+    }
+
+    const size_t row_size = ggml_row_size(type, k);
+    std::vector<float> row((size_t) k);
+
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t used = 0; used < n_used; ++used) {
+            const int64_t slot = data.ids[(size_t) token*n_used + (size_t) used];
+            for (int64_t row_idx = 0; row_idx < m; ++row_idx) {
+                const uint8_t * qrow = data.as_quant.data() + ((size_t) slot*m + (size_t) row_idx)*row_size;
+                traits->to_float(qrow, row.data(), k);
+
+                float sum = 0.0f;
+                for (int64_t col = 0; col < k; ++col) {
+                    const float bv = data.b[(size_t) token*n_used*k + (size_t) used*k + (size_t) col];
+                    sum += row[(size_t) col] * bv;
+                }
+                data.reference[(size_t) token*n_used*m + (size_t) used*m + (size_t) row_idx] = sum;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool run_cuda_case(const char * name, ggml_backend_t backend, ggml_type type,
+        int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens, bool enable_mmvq) {
+    set_slot_mmvq_env(enable_mmvq);
+
+    graph_case gc = build_case(type, k, m, n_slots, n_used, n_tokens);
+    if (!gc.ctx) {
+        fprintf(stderr, "[test-slot-mmvq] %s: ggml_init failed\n", name);
+        return false;
+    }
+
+    tensor_data data;
+    fill_data(data, type, k, m, n_slots, n_used, n_tokens);
+    if (!compute_reference(data, type, k, m, n_used, n_tokens)) {
+        ggml_free(gc.ctx);
+        fprintf(stderr, "[test-slot-mmvq] %s: reference conversion unavailable\n", name);
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(gc.ctx, backend);
+    if (!buffer) {
+        ggml_free(gc.ctx);
+        fprintf(stderr, "[test-slot-mmvq] %s: tensor allocation failed\n", name);
+        return false;
+    }
+
+    ggml_backend_tensor_set(gc.as, data.as_quant.data(), 0, data.as_quant.size());
+    ggml_backend_tensor_set(gc.b, data.b.data(), 0, data.b.size()*sizeof(float));
+    ggml_backend_tensor_set(gc.ids, data.ids.data(), 0, data.ids.size()*sizeof(int32_t));
+
+    const ggml_status status = ggml_backend_graph_compute(backend, gc.gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(gc.ctx);
+        fprintf(stderr, "[test-slot-mmvq] %s: graph compute failed: %s\n", name, ggml_status_to_string(status));
+        return false;
+    }
+
+    std::vector<float> out((size_t) ggml_nelements(gc.out));
+    ggml_backend_tensor_get(gc.out, out.data(), 0, out.size()*sizeof(float));
+
+    double max_abs = 0.0;
+    double rms = 0.0;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const double diff = (double) out[i] - (double) data.reference[i];
+        max_abs = std::max(max_abs, std::abs(diff));
+        rms += diff*diff;
+    }
+    rms = std::sqrt(rms / std::max<size_t>(out.size(), 1));
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(gc.ctx);
+
+    // Q4_0 accumulation differences are expected; this gate catches indexing
+    // and layout mistakes without requiring bit-identical CUDA/CPU arithmetic.
+    if (max_abs > 0.08 || rms > 0.02) {
+        fprintf(stderr, "[test-slot-mmvq] %s: mismatch max_abs=%.8f rms=%.8f\n", name, max_abs, rms);
+        return false;
+    }
+
+    printf("[test-slot-mmvq] %s OK max_abs=%.8f rms=%.8f\n", name, max_abs, rms);
+    return true;
+}
+
+} // namespace
+
+int main() {
+#if !defined(GGML_USE_CUDA)
+    fprintf(stderr, "[test-slot-mmvq] CUDA disabled at build time - skipping.\n");
+    return 0;
+#else
+    ggml_backend_load_all();
+
+    if (ggml_backend_cuda_get_device_count() <= 0) {
+        fprintf(stderr, "[test-slot-mmvq] No CUDA device available - skipping.\n");
+        return 0;
+    }
+
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        return fail("ggml_backend_cuda_init failed");
+    }
+
+    constexpr ggml_type type = GGML_TYPE_Q4_0;
+    constexpr int64_t k = 128;
+    constexpr int64_t m = 64;
+    constexpr int64_t n_slots = 16;
+    constexpr int64_t n_used = 4;
+
+    bool ok = true;
+    ok = run_cuda_case("decode generic sorted", backend, type, k, m, n_slots, n_used, 1, false) && ok;
+    ok = run_cuda_case("decode guarded MMVQ", backend, type, k, m, n_slots, n_used, 1, true) && ok;
+    ok = run_cuda_case("prefill guard fallback", backend, type, k, m, n_slots, n_used, 4, true) && ok;
+
+    ggml_backend_free(backend);
+    set_slot_mmvq_env(false);
+
+    return ok ? 0 : 1;
+#endif
+}

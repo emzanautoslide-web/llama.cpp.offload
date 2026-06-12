@@ -1,5 +1,8 @@
 *
 !*.*
+!moe-offload/
+moe-offload/*
+!moe-offload/test-slot-mmvq.cpp
 !snapshots/
 *.o
 ggml-common.h
