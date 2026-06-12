@@ -1,6 +1,6 @@
 # MoE Offload Known Issues
 
-Status as of the guarded Phase F validation on 2026-06-12.
+Status as of the guarded Phase H validation on 2026-06-12.
 
 ## Open
 
@@ -84,22 +84,40 @@ Relevant diagnostics:
 - `LLAMA_MOE_UBATCH_SAFETY=F`
 - `LLAMA_MOE_MIN_SLOTS=N`
 
-### CUDA Top-k MoE Fusion Is Disabled
+### CUDA Top-k MoE Fusion Is Disabled By Default
 
-CUDA top-k MoE fusion is disabled in `LLAMA_MOE_OFFLOAD` builds. During MVP
-closeout, full-cache forced-streaming diagnostics showed the same logit drift
-with and without remapped slot ids, while `GGML_CUDA_DISABLE_FUSION=1` matched
-golden logits exactly. Per-fusion isolation showed that disabling top-k MoE
-fusion alone was sufficient. Phase G re-tested the single-row decode top-k
-fused path behind an experimental guard and it still failed the golden-logit
-gate (`max|d| = 4.639292e-01` at step 3), so `LLAMA_MOE_TOPK_FUSION=1` is
-ignored in `LLAMA_MOE_OFFLOAD` builds for now.
+CUDA top-k MoE fusion is still disabled for normal `LLAMA_MOE_OFFLOAD` runs.
+`LLAMA_MOE_TOPK_FUSION=1` is ignored in offload builds.
+
+Phase H found and fixed the earlier single-token decode correctness failure
+behind an explicit diagnostic gate, `LLAMA_MOE_TOPK_FUSION_DIAG=1`. The root
+cause was the callback/fusion boundary: streaming mode stopped graph execution
+at `ffn_moe_topk`, but the fused CUDA router needs the graph segment through
+final routing weights to execute as one unit. Phase H registers final routing
+weights as the callback point while still reading expert IDs from the original
+top-k tensor.
+
+Current status:
+
+- Diagnostic decode top-k fusion passed the synthetic routing test.
+- Golden logits passed with top-k fusion alone, top-k + GLU fusion, and top-k +
+  GLU fusion + guarded graphs: `max|d| = 0`.
+- `llama-cli` chat smoke passed with the full diagnostic stack.
+- The same-build 8000 MiB EAMC benchmark did not show a material decode gain:
+  TPOT was flat at 31.91 -> 31.88 ms/token, `topk_d2h_us` stayed flat at
+  1.58 ms/token, and callback wall time was slightly worse.
+- The large Phase H prefill speedup is not evidence for top-k fusion. It is
+  present in the Phase H baseline with diagnostic fusion disabled, because the
+  callback now reads strided top-k views correctly with
+  `ggml_backend_tensor_get_2d()`.
 
 Impact:
 
-- Correctness is preserved for the MVP and performance work to date.
-- Throughput may be lower until the fused path is made safe for the MoE
-  offload callback/remap flow.
+- Correctness is preserved by keeping the normal path default-off.
+- The diagnostic gate exists for focused decode experiments only.
+- Do not promote top-k fusion until a broader benchmark shows consistent TPOT
+  or callback/top-k-D2H improvement without regressing H2D, stall, predictor,
+  SSD, hit rate, or misses/token.
 
 ### Specialized `.slot` `MUL_MAT_ID` Paths Are Mostly Bypassed
 
@@ -127,9 +145,16 @@ Current status:
   versus the Phase F guard stack in the same static build and reduced decode
   callback wall time from 17.78 ms/token to 17.06 ms/token. Decode
   `gpu_compute` was effectively flat at 10.44 to 10.37 ms/token.
+- Phase H fixed strided top-k callback reads on the default path. On the 8000
+  MiB EAMC benchmark this improved prefill from 14021.9 ms to 5070.4 ms versus
+  the Phase G GLU run, mostly by reducing false expert demand in prefill
+  callbacks.
+- Phase H also fixed top-k fusion correctness under
+  `LLAMA_MOE_TOPK_FUSION_DIAG=1`, but kept it default-off because decode TPOT
+  and `topk_d2h_us` were flat in the same-build top-k-fusion benchmark.
 - `.slot` MMQ/MMF, multi-token prefill fast paths, generic sorted graph
-  capture, and non-GLU fusion remain bypassed or disabled until separately
-  validated.
+  capture, normal top-k fusion, and non-GLU fusion remain bypassed or disabled
+  until separately validated.
 
 ### EAMC Row Caps Are Diagnostic Only
 

@@ -123,10 +123,20 @@ static bool ggml_cuda_moe_slot_glu_fusion_enabled() {
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+static bool ggml_cuda_moe_topk_fusion_diag_enabled() {
+    const char * env = getenv("LLAMA_MOE_TOPK_FUSION_DIAG");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 static bool ggml_cuda_moe_topk_fusion_enabled(const ggml_tensor * logits = nullptr) {
 #ifdef LLAMA_MOE_OFFLOAD
-    GGML_UNUSED(logits);
-    return false;
+    if (!ggml_cuda_moe_topk_fusion_diag_enabled()) {
+        return false;
+    }
+    // Phase H diagnostic only: keep the normal offload path unchanged and
+    // constrain the fused path to single-token decode until the full validation
+    // matrix passes.
+    return logits == nullptr || ggml_nrows(logits) == 1;
 #else
     GGML_UNUSED(logits);
     return true;

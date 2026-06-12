@@ -60,6 +60,11 @@ struct slot_pool_state {
     std::unordered_map<ggml_tensor *, ggml_tensor *> topk_to_slot_table;
     std::unordered_map<ggml_tensor *, ggml_tensor *> topk_to_slot_ids;
     std::unordered_map<ggml_tensor *, int> topk_to_logical;
+    // Phase H: optional callback points after routing weights. This lets the
+    // CUDA top-k MoE fusion compute ids+weights together before the callback
+    // pauses execution to make slot weights resident.
+    std::unordered_map<ggml_tensor *, ggml_tensor *> callback_to_topk;
+    std::unordered_map<ggml_tensor *, ggml_tensor *> topk_to_callback;
     // Flat list of all registered slot_table tensors across graph builds.
     // Used by populate_slot_tables_identity (non-streaming mode) which writes
     // the identity mapping to all of them.
@@ -238,6 +243,8 @@ void configure_slot_pool() {
     s.topk_to_slot_table.clear();
     s.topk_to_slot_ids.clear();
     s.topk_to_logical.clear();
+    s.callback_to_topk.clear();
+    s.topk_to_callback.clear();
     s.all_slot_tables.clear();
     s.cache.assign(mf.n_layers, slot_pool_state::layer_cache{});
     for (auto & lc : s.cache) {
@@ -284,6 +291,8 @@ void reset_slot_pool() {
     s.topk_to_slot_table.clear();
     s.topk_to_slot_ids.clear();
     s.topk_to_logical.clear();
+    s.callback_to_topk.clear();
+    s.topk_to_callback.clear();
     s.all_slot_tables.clear();
     s.cache.clear();
     s.slot_table_host.clear();
@@ -692,6 +701,27 @@ void register_slot_table_for_topk(int logical_layer, ggml_tensor * topk, ggml_te
     ++reg_cnt;
 }
 
+void register_weights_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * weights) {
+    auto & s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.configured || !topk || !weights) {
+        if (debug_d4_trace()) {
+            fprintf(stderr, "[moe-d4] register_weights_for_topk SKIP: cfg=%d topk=%p weights=%p L=%d\n",
+                    s.configured ? 1 : 0, (void*) topk, (void*) weights, logical_layer);
+        }
+        return;
+    }
+    s.callback_to_topk[weights] = topk;
+    s.topk_to_callback[topk] = weights;
+    s.topk_to_logical[weights] = logical_layer;
+    static int reg_cnt = 0;
+    if (debug_d4_trace() && reg_cnt < 4) {
+        fprintf(stderr, "[moe-d4] register_weights_for_topk #%d L=%d topk=%p weights=%p\n",
+                reg_cnt, logical_layer, (void*) topk, (void*) weights);
+    }
+    ++reg_cnt;
+}
+
 void register_slot_ids_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * slot_ids) {
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
@@ -719,6 +749,8 @@ void reset_graph_state() {
     s.topk_to_slot_table.clear();
     s.topk_to_slot_ids.clear();
     s.topk_to_logical.clear();
+    s.callback_to_topk.clear();
+    s.topk_to_callback.clear();
     s.all_slot_tables.clear();
 }
 
@@ -935,17 +967,31 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (ask) {
         std::lock_guard<std::mutex> lock(s.mutex);
-        return s.configured && s.topk_to_logical.find(t) != s.topk_to_logical.end();
+        if (!s.configured) {
+            return false;
+        }
+        if (s.topk_to_logical.find(t) == s.topk_to_logical.end()) {
+            return false;
+        }
+        const bool has_callback = s.topk_to_callback.find(t) != s.topk_to_callback.end();
+        return !has_callback;
     }
 
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.configured) return true;
     release_completed_h2d_buffers(s);
 
-    // Fast lookup: only react to topk tensors we previously registered.
-    auto stt_it = s.topk_to_slot_table.find(t);
+    // Fast lookup: only react to top-k tensors, or to an alternate callback
+    // tensor that maps back to a top-k tensor.
+    ggml_tensor * topk_tensor = t;
+    auto cb_it = s.callback_to_topk.find(t);
+    if (cb_it != s.callback_to_topk.end()) {
+        topk_tensor = cb_it->second;
+    }
+
+    auto stt_it = s.topk_to_slot_table.find(topk_tensor);
     ggml_tensor * stt = stt_it == s.topk_to_slot_table.end() ? nullptr : stt_it->second;
-    auto slot_ids_it = s.topk_to_slot_ids.find(t);
+    auto slot_ids_it = s.topk_to_slot_ids.find(topk_tensor);
     ggml_tensor * slot_ids_tensor = slot_ids_it == s.topk_to_slot_ids.end() ? nullptr : slot_ids_it->second;
     auto log_it = s.topk_to_logical.find(t);
     if (log_it == s.topk_to_logical.end()) return true;
@@ -1010,11 +1056,19 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     // Read top-k IDs (D2H). Shape: [n_expert_used, n_tokens] I32.
-    const int64_t n_elem = ggml_nelements(t);
-    const int64_t n_tokens = t->ne[1];
+    const int64_t n_elem = ggml_nelements(topk_tensor);
+    const int64_t n_tokens = topk_tensor->ne[1];
     std::vector<int32_t> ids((size_t) n_elem);
     const auto topk_d2h_start = std::chrono::steady_clock::now();
-    ggml_backend_tensor_get(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+    if (topk_tensor->nb[1] == topk_tensor->ne[0] * (int64_t) topk_tensor->nb[0]) {
+        ggml_backend_tensor_get(topk_tensor, ids.data(), 0, ids.size() * sizeof(int32_t));
+    } else {
+        ggml_backend_tensor_get_2d(topk_tensor, ids.data(), 0,
+                (size_t) topk_tensor->ne[0] * sizeof(int32_t),
+                (size_t) n_tokens,
+                (size_t) topk_tensor->nb[1],
+                (size_t) topk_tensor->ne[0] * sizeof(int32_t));
+    }
     const auto topk_d2h_end = std::chrono::steady_clock::now();
     const int64_t topk_d2h_us = elapsed_us(topk_d2h_start, topk_d2h_end);
 

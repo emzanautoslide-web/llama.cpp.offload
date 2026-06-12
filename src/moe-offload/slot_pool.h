@@ -81,6 +81,7 @@ bool prefetch_all_experts();
 // MUL_MAT_ID. In full-residency mode the original expert IDs are used.
 void register_slot_table_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * slot_table);
 void register_slot_ids_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * slot_ids);
+void register_weights_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * weights);
 void populate_slot_tables_identity();
 
 // Clear per-graph-build slot_table bookkeeping (topk->slot_table maps and the

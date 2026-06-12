@@ -1483,6 +1483,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
+    ggml_tensor * routing_selected_experts = selected_experts;
 
 #ifdef LLAMA_MOE_OFFLOAD
     // Phase D: when MoE offload is active, `slot_selected_experts` maps each
@@ -1537,6 +1538,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
     }
+
+#ifdef LLAMA_MOE_OFFLOAD
+    // Phase H diagnostic: CUDA top-k MoE fusion needs the graph segment through
+    // final routing weights. In streaming mode the eval callback normally stops
+    // at selected_experts; register the weights tensor as an alternate callback
+    // point while still reading IDs from selected_experts.
+    {
+        const char * topk_diag = std::getenv("LLAMA_MOE_TOPK_FUSION_DIAG");
+        if (topk_diag && topk_diag[0] != '\0' && std::strcmp(topk_diag, "0") != 0 && n_tokens == 1) {
+            llama_moe::register_weights_for_topk(il, routing_selected_experts, weights);
+        }
+    }
+#endif
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);

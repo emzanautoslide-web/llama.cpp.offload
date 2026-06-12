@@ -3,6 +3,7 @@
 !moe-offload/
 moe-offload/*
 !moe-offload/test-slot-mmvq.cpp
+!moe-offload/test-topk-moe-fusion.cpp
 !snapshots/
 *.o
 ggml-common.h

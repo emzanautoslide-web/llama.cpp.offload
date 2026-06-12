@@ -322,6 +322,7 @@ if (LLAMA_MOE_OFFLOAD)
 
     if (TARGET ggml-cuda)
         llama_build_and_test(moe-offload/test-slot-mmvq.cpp LABEL "moe-offload")
+        llama_build_and_test(moe-offload/test-topk-moe-fusion.cpp LABEL "moe-offload")
     endif()
 
     # Phase K unit tests — see docs/implementation_plan_mvp_20260529.md §3.
