@@ -161,9 +161,19 @@ Impact:
 ### Profiler `stall_us` Is Approximate
 
 `h2d_us` and `compute_us` are event-based where CUDA events are available.
-`stall_us` is still host wall time around miss completion and compute-stream
-wait insertion, so it is an approximation of overlap loss rather than a pure
-GPU timeline metric.
+After Perf-D, the normal async path no longer synchronizes the host on every
+H2D event before recycling pinned memory. `stall_us` is still host wall time
+around miss-loop no-progress/yield cases and fallback synchronization, so it is
+an approximation of overlap loss rather than a pure GPU timeline metric.
+
+### Windows Application Control Can Block Fresh CUDA Builds
+
+On the 2026-06-12 Perf-D dev-box run, Windows Application Control blocked the
+freshly rebuilt compressed `ggml-cuda.dll` with status `0xc0e90002`.
+Configuring `build-moe` with `-DGGML_CUDA_COMPRESSION_MODE=none` produced a
+loadable CUDA backend for benchmarking. The same policy can block freshly
+rebuilt unsigned test executables, which affected `test-cuda-stream.exe` during
+CTest validation.
 
 ## Deferred
 

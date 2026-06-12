@@ -181,7 +181,7 @@ CSV columns:
 | `ssd_read_us` | Wall microseconds spent in `fread` for misses (worker-thread-measured). |
 | `h2d_us` | Microseconds spent in host→device copy. On the CUDA async path this is the sum of `cudaEventElapsedTime` between the per-blob begin/end events recorded on the dedicated MoE H2D stream; on the sync fallback it is host-measured around `ggml_backend_tensor_set`. Mixed contribution per row when both paths fire. |
 | `compute_us` | CUDA-event-timed compute interval for the layer, derived from begin/end events recorded on the compute stream and queried at `slot_pool_end_request()`. Each row's interval brackets the slot_table write of layer L through the topk callback of layer L+1 (or `end_request` for the final layer); this is an over-approximation that includes layer L's MoE compute plus the following attention block. |
-| `stall_us` | Host wall-clock around miss completion and compute-stream wait insertion for miss events. This is still an approximation of overlap loss, not a pure CUDA event duration. |
+| `stall_us` | Host wall-clock spent waiting/yielding for miss progress after async H2D copies are submitted. The normal CUDA path inserts a compute-stream event wait and recycles pinned buffers later via event polling, so this no longer includes a host synchronize for every H2D copy. It is still an approximation of overlap loss, not a pure CUDA event duration. |
 | `pred_us` | Host microseconds spent in predictor `observe()` plus eviction `score()` calls for this row. |
 | `pred_observe_us` | Predictor observation time. |
 | `pred_score_us` | Predictor eviction-score time. |
@@ -223,6 +223,7 @@ Implemented in this slice:
 - **I**: Real `compute_us` via CUDA events. Profile rows are buffered per `llama_decode` batch and flushed at `slot_pool_end_request()` after `cudaEventElapsedTime` queries. Per-miss `h2d_us` now comes from event timing on the async path.
 - **Perf-B**: EAMC remains online in DRAM, but per-token sidecar saves were removed. Full-capacity EAMC uses FIFO/ring replacement instead of quadratic redundancy pruning; sidecars are saved at benchmark end or context/session teardown.
 - **Perf-C**: EAMC scoring uses sparse corpus rows, an inverted `(layer, expert)` index for dense-equivalent uncapped cosine scoring, lazy per-callback score-vector materialization, and profiler counters for cosine/materialization/cache activity. Corpus row caps remain diagnostic-only through `LLAMA_MOE_EAMC_ROWS=N`.
+- **Perf-D**: Async H2D pinned buffers are no longer recycled by synchronizing the host on every copy event. The compute stream still waits on each H2D end event for correctness; pinned buffers are tracked in an inflight list and returned to the pool after `io_event_query()` reports completion. Miss submissions are sorted by file offset. On the 8000 MiB EAMC benchmark this cut decode `stall_us` from about 16.8 ms/token to 0.41 ms/token, but TPOT did not improve because SSD/callback time rose in that run.
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
 - **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
 - **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. CUDA `MUL_MAT_ID` on `.slot` tensors bypasses the specialized MMVQ/MMQ/MMF paths and uses the generic sorted path for correctness-first validation.
@@ -373,3 +374,17 @@ uses callback-filled slot-id tensors and generic `.slot` `MUL_MAT_ID`.
 Large-ubatch failures should now surface as `n_uniq exceeds n_slots` or an I/O
 progress error; a CUDA illegal access is a regression and should be captured
 with the cache size, effective ubatch, and prompt.
+
+### Windows Application Control blocks rebuilt CUDA binaries
+
+On the dev box used for Perf-D, a freshly rebuilt compressed CUDA backend failed
+to load with `0xc0e90002` / "Application Control policy has blocked this file".
+Reconfiguring with uncompressed CUDA fatbins produced a loadable backend:
+
+```powershell
+cmake -S . -B build-moe -DGGML_CUDA_COMPRESSION_MODE=none
+cmake --build build-moe --config Release --target llama-moe-bench
+```
+
+This is a local Windows policy issue, not a MoE runtime setting. It can also
+block freshly rebuilt unsigned test executables such as `test-cuda-stream.exe`.

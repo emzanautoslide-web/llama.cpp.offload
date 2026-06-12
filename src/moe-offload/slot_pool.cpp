@@ -24,6 +24,7 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -112,12 +113,29 @@ struct slot_pool_state {
     std::vector<pending_profile_row> pending_rows;
     int last_pending_idx = -1;
     std::string current_request_phase = "unknown";
+
+    // Async H2D buffer lifetime tracking. Events are borrowed from the
+    // pending profile rows above; only pinned_buf ownership lives here.
+    struct inflight_h2d_buffer {
+        void * pinned_buf = nullptr;
+        void * h2d_begin_event = nullptr;
+        void * h2d_event = nullptr;
+        int layer = -1;
+        int expert = -1;
+        int kind = -1;
+        int slot = -1;
+    };
+    std::vector<inflight_h2d_buffer> inflight_h2d;
 };
 
 slot_pool_state & state() {
     static slot_pool_state instance;
     return instance;
 }
+
+int release_completed_h2d_buffers(slot_pool_state & s);
+void wait_all_h2d_buffers(slot_pool_state & s);
+void discard_pending_profile_rows(slot_pool_state & s);
 
 uint32_t min_viable_slots(const manifest & mf) {
     const uint32_t n_experts = mf.n_experts_per_layer;
@@ -199,6 +217,9 @@ void configure_slot_pool() {
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
 
+    wait_all_h2d_buffers(s);
+    discard_pending_profile_rows(s);
+
     s.configured = false;
     s.n_slots = 0;
     s.slot_tensors.clear();
@@ -254,6 +275,8 @@ void configure_slot_pool() {
 void reset_slot_pool() {
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
+    wait_all_h2d_buffers(s);
+    discard_pending_profile_rows(s);
     s.configured = false;
     s.n_slots = 0;
     s.slot_tensors.clear();
@@ -273,6 +296,7 @@ void reset_slot_pool() {
 void slot_pool_reset_cache() {
     auto & s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
+    wait_all_h2d_buffers(s);
     for (auto & lc : s.cache) {
         std::fill(lc.slot_to_expert.begin(), lc.slot_to_expert.end(), -1);
         lc.exp2slot.clear();
@@ -759,6 +783,49 @@ static int64_t elapsed_us(std::chrono::steady_clock::time_point start,
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+int release_completed_h2d_buffers(slot_pool_state & s) {
+    int released = 0;
+    auto it = s.inflight_h2d.begin();
+    while (it != s.inflight_h2d.end()) {
+        if (!it->h2d_event || io_event_query(it->h2d_event)) {
+            if (it->pinned_buf) {
+                io_release_buffer(it->pinned_buf);
+            }
+            it = s.inflight_h2d.erase(it);
+            ++released;
+        } else {
+            ++it;
+        }
+    }
+    return released;
+}
+
+void wait_all_h2d_buffers(slot_pool_state & s) {
+    for (auto & b : s.inflight_h2d) {
+        if (b.h2d_event) {
+            io_event_sync(b.h2d_event);
+        }
+        if (b.pinned_buf) {
+            io_release_buffer(b.pinned_buf);
+            b.pinned_buf = nullptr;
+        }
+    }
+    s.inflight_h2d.clear();
+}
+
+void discard_pending_profile_rows(slot_pool_state & s) {
+    for (auto & p : s.pending_rows) {
+        if (p.compute_begin_event) io_event_release(p.compute_begin_event);
+        if (p.compute_end_event)   io_event_release(p.compute_end_event);
+        for (auto & ev_pair : p.h2d_events) {
+            if (ev_pair.first)  io_event_release(ev_pair.first);
+            if (ev_pair.second) io_event_release(ev_pair.second);
+        }
+    }
+    s.pending_rows.clear();
+    s.last_pending_idx = -1;
+}
+
 void set_tensor_for_compute(slot_pool_state & s, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     if (s.compute_backend && tensor && tensor->buffer &&
             ggml_backend_supports_buft(s.compute_backend, ggml_backend_buffer_get_type(tensor->buffer))) {
@@ -873,6 +940,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.configured) return true;
+    release_completed_h2d_buffers(s);
 
     // Fast lookup: only react to topk tensors we previously registered.
     auto stt_it = s.topk_to_slot_table.find(t);
@@ -1220,10 +1288,16 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 dbg_hits, dbg_misses, dbg_free_alloc, dbg_evictions, s.n_slots);
     }
 
+    std::sort(miss_blobs.begin(), miss_blobs.end(),
+            [](const miss_blob & a, const miss_blob & b) {
+                return a.file_offset < b.file_offset;
+            });
+
     auto drain_completed = [&]() -> int {
         auto completions = io_drain_completed();
         const int n = (int) completions.size();
         for (auto & c : completions) {
+            bool release_pinned_now = true;
             if (!c.ok) {
                 LLAMA_LOG_ERROR("moe_eval_callback: I/O failed loading L%d e%d k%d slot=%d "
                         "offset=%llu bytes=%zu got=%zu errno=%d\n",
@@ -1242,17 +1316,28 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
             if (c.h2d_event) {
                 // Async path: tell the compute stream to wait on the H2D end
-                // event before consuming slot weights. Also synchronize the
-                // event before recycling the pinned staging buffer; otherwise
-                // a later fread could overwrite host memory that CUDA is still
-                // reading.
-                io_compute_wait(s.compute_backend, c.h2d_event);
+                // event before consuming slot weights. Recycle the pinned
+                // staging buffer later, once the end event has completed.
+                const bool compute_wait_ok = io_compute_wait(s.compute_backend, c.h2d_event);
                 h2d_events_for_row.emplace_back(c.h2d_begin_event, c.h2d_event);
-                const auto h2d_wait_start = std::chrono::steady_clock::now();
-                io_event_sync(c.h2d_event);
-                const auto h2d_wait_end = std::chrono::steady_clock::now();
-                stall_us += std::chrono::duration_cast<std::chrono::microseconds>(
-                        h2d_wait_end - h2d_wait_start).count();
+                if (compute_wait_ok) {
+                    s.inflight_h2d.push_back(slot_pool_state::inflight_h2d_buffer{
+                        c.pinned_buf,
+                        c.h2d_begin_event,
+                        c.h2d_event,
+                        c.layer,
+                        c.expert,
+                        c.kind,
+                        c.slot,
+                    });
+                    release_pinned_now = false;
+                } else {
+                    const auto h2d_wait_start = std::chrono::steady_clock::now();
+                    io_event_sync(c.h2d_event);
+                    const auto h2d_wait_end = std::chrono::steady_clock::now();
+                    stall_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                            h2d_wait_end - h2d_wait_start).count();
+                }
             } else {
                 // Fallback: CUDA unavailable or io_h2d_async failed. Look up
                 // the slot tensor by the pinned-buffer handle and do a sync
@@ -1278,10 +1363,13 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 lc.fingerprints[c.expert] = fp;
             }
 
-            io_release_buffer(c.pinned_buf);
+            if (release_pinned_now) {
+                io_release_buffer(c.pinned_buf);
+            }
             miss_lookup.erase(c.pinned_buf);
             ++completed_misses;
         }
+        release_completed_h2d_buffers(s);
         return n;
     };
 
@@ -1295,6 +1383,10 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             while (next_miss < miss_blobs.size()) {
                 void * pinned = io_try_acquire_buffer();
                 if (!pinned) {
+                    if (release_completed_h2d_buffers(s) > 0) {
+                        made_progress = true;
+                        continue;
+                    }
                     break;
                 }
 
@@ -1327,10 +1419,15 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             if (drain_completed() > 0) {
                 made_progress = true;
             }
+            if (release_completed_h2d_buffers(s) > 0) {
+                made_progress = true;
+            }
 
             if (!made_progress) {
-                if (io_outstanding() == 0) {
-                    if (drain_completed() > 0) {
+                const bool waiting_for_h2d_buffer =
+                    next_miss < miss_blobs.size() && !s.inflight_h2d.empty();
+                if (io_outstanding() == 0 && !waiting_for_h2d_buffer) {
+                    if (drain_completed() > 0 || release_completed_h2d_buffers(s) > 0) {
                         continue;
                     }
                     LLAMA_LOG_ERROR("moe_eval_callback: no I/O progress while loading misses "
@@ -1342,6 +1439,7 @@ bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 const auto wait_start = std::chrono::steady_clock::now();
                 std::this_thread::yield();
                 drain_completed();
+                release_completed_h2d_buffers(s);
                 const auto wait_end = std::chrono::steady_clock::now();
                 stall_us += std::chrono::duration_cast<std::chrono::microseconds>(
                         wait_end - wait_start).count();
@@ -1585,6 +1683,11 @@ void slot_pool_init_io(const std::string & source_path) {
 }
 
 void slot_pool_shutdown_io() {
+    auto & s = state();
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        wait_all_h2d_buffers(s);
+    }
     io_shutdown();
     LLAMA_LOG_INFO("%s: io worker stopped; events_in_use=%zu\n",
             __func__, io_events_in_use());
@@ -1627,6 +1730,11 @@ void slot_pool_end_request() {
             }
         }
     }
+
+    // Ensure borrowed H2D events are complete before profile rows query and
+    // release them. This can still block at request end if copies from the
+    // final callback are in flight.
+    wait_all_h2d_buffers(s);
 
     // Phase I: drain buffered rows. Query CUDA elapsed times for compute
     // and h2d intervals, patch into the row, hand off to the profiler,

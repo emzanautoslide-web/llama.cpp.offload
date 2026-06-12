@@ -123,6 +123,10 @@ LLAMA_API bool io_compute_wait(ggml_backend_t backend, void * ev);
 // Returns false if CUDA is unavailable.
 LLAMA_API bool io_event_sync(void * ev);
 
+// Non-blocking event completion query. Returns true only when the event has
+// completed; returns false when not ready, on error, or when CUDA is unavailable.
+LLAMA_API bool io_event_query(void * ev);
+
 // Diagnostic: number of events currently held by callers (not in the pool).
 LLAMA_API size_t io_events_in_use();
 
