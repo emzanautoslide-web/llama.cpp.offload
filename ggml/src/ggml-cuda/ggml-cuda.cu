@@ -113,6 +113,11 @@ static bool ggml_cuda_moe_slot_mmvq_enabled() {
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
+static bool ggml_cuda_moe_slot_graphs_enabled() {
+    const char * env = getenv("LLAMA_MOE_SLOT_GRAPHS");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
 void ggml_cuda_set_device(int device) {
@@ -3277,6 +3282,41 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 }
 
 #ifdef USE_CUDA_GRAPH
+static bool ggml_cuda_moe_slot_mmvq_graph_compatible(const ggml_tensor * node, int cc) {
+    GGML_ASSERT(node);
+    GGML_ASSERT(node->op == GGML_OP_MUL_MAT_ID);
+
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const ggml_tensor * ids  = node->src[2];
+
+    if (!ggml_cuda_moe_slot_graphs_enabled() || !ggml_cuda_moe_slot_mmvq_enabled()) {
+        return false;
+    }
+
+    if (!ggml_cuda_is_moe_slot_tensor(src0)) {
+        return false;
+    }
+
+    if (!src1 || !ids || src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || node->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (!ggml_is_quantized(src0->type)) {
+        return false;
+    }
+
+    // Phase F only admits the decode shape already validated by the guarded
+    // MMVQ path. Prefill/multi-token slot graphs continue to use the generic
+    // path without CUDA graph capture.
+    if (node->ne[2] != 1) {
+        return false;
+    }
+
+    const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+    return node->ne[2] <= mmvq_mmid_max;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3302,11 +3342,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             const bool moe_slot_tensor = ggml_cuda_is_moe_slot_tensor(node->src[0]);
             if (moe_slot_tensor) {
-                // Keep MoE slot graphs disabled until callback/remap ordering is
-                // proven safe for both the generic path and guarded MMVQ path.
-                use_cuda_graph = false;
+                const bool slot_graph_compatible = ggml_cuda_moe_slot_mmvq_graph_compatible(node, cc);
+                if (!slot_graph_compatible) {
+                    use_cuda_graph = false;
+                }
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to MoE slot tensor\n", __func__);
+                if (!slot_graph_compatible) {
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported MoE slot tensor\n", __func__);
+                }
 #endif
             } else if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs

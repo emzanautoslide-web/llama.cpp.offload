@@ -3,9 +3,10 @@
 //
 // The test builds a synthetic `.slot` MUL_MAT_ID graph and compares the CUDA
 // output against a CPU reference computed from the same quantized slot tensor.
-// It runs both the default generic sorted path and the guarded
-// LLAMA_MOE_SLOT_MMVQ=1 path for a decode-shaped batch. A prefill-shaped batch
-// is also checked with the guard enabled to verify it still falls back cleanly.
+// It runs the default generic sorted path, the guarded LLAMA_MOE_SLOT_MMVQ=1
+// path, and the LLAMA_MOE_SLOT_GRAPHS=1 replay path for a decode-shaped batch.
+// A prefill-shaped batch is also checked with the guard enabled to verify it
+// still falls back cleanly.
 // ===========================================================================
 
 #include "ggml.h"
@@ -52,6 +53,14 @@ void set_slot_mmvq_env(bool enabled) {
 #endif
 }
 
+void set_slot_graphs_env(bool enabled) {
+#if defined(_WIN32)
+    _putenv(enabled ? "LLAMA_MOE_SLOT_GRAPHS=1" : "LLAMA_MOE_SLOT_GRAPHS=0");
+#else
+    setenv("LLAMA_MOE_SLOT_GRAPHS", enabled ? "1" : "0", 1);
+#endif
+}
+
 graph_case build_case(ggml_type type, int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens) {
     const size_t tensor_count = 8;
     ggml_init_params params = {
@@ -84,7 +93,7 @@ graph_case build_case(ggml_type type, int64_t k, int64_t m, int64_t n_slots, int
     return gc;
 }
 
-void fill_data(tensor_data & data, ggml_type type, int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens) {
+void fill_data(tensor_data & data, ggml_type type, int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens, int variant = 0) {
     data.as_float.resize((size_t) k*m*n_slots);
     data.b.resize((size_t) k*n_used*n_tokens);
     data.ids.resize((size_t) n_used*n_tokens);
@@ -94,7 +103,7 @@ void fill_data(tensor_data & data, ggml_type type, int64_t k, int64_t m, int64_t
         for (int64_t row = 0; row < m; ++row) {
             for (int64_t col = 0; col < k; ++col) {
                 const size_t idx = (size_t) slot*k*m + (size_t) row*k + (size_t) col;
-                const int v = (int) ((idx*17 + 11*slot + 5*row + col) % 127) - 63;
+                const int v = (int) ((idx*17 + 11*slot + 5*row + col + 23*variant) % 127) - 63;
                 data.as_float[idx] = (float) v / 64.0f;
             }
         }
@@ -102,10 +111,10 @@ void fill_data(tensor_data & data, ggml_type type, int64_t k, int64_t m, int64_t
 
     for (int64_t token = 0; token < n_tokens; ++token) {
         for (int64_t used = 0; used < n_used; ++used) {
-            data.ids[(size_t) token*n_used + (size_t) used] = (int32_t) ((token*3 + used*5) % n_slots);
+            data.ids[(size_t) token*n_used + (size_t) used] = (int32_t) ((token*3 + used*5 + 7*variant) % n_slots);
             for (int64_t col = 0; col < k; ++col) {
                 const size_t idx = (size_t) token*n_used*k + (size_t) used*k + (size_t) col;
-                const int v = (int) ((idx*13 + 7*token + 3*used + col) % 97) - 48;
+                const int v = (int) ((idx*13 + 7*token + 3*used + col + 19*variant) % 97) - 48;
                 data.b[idx] = (float) v / 48.0f;
             }
         }
@@ -153,9 +162,37 @@ bool compute_reference(tensor_data & data, ggml_type type, int64_t k, int64_t m,
     return true;
 }
 
+bool check_output(const char * name, const std::vector<float> & out, const std::vector<float> & reference) {
+    if (out.size() != reference.size()) {
+        fprintf(stderr, "[test-slot-mmvq] %s: output size mismatch got=%zu want=%zu\n",
+                name, out.size(), reference.size());
+        return false;
+    }
+
+    double max_abs = 0.0;
+    double rms = 0.0;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const double diff = (double) out[i] - (double) reference[i];
+        max_abs = std::max(max_abs, std::abs(diff));
+        rms += diff*diff;
+    }
+    rms = std::sqrt(rms / std::max<size_t>(out.size(), 1));
+
+    // Q4_0 accumulation differences are expected; this gate catches indexing
+    // and layout mistakes without requiring bit-identical CUDA/CPU arithmetic.
+    if (max_abs > 0.08 || rms > 0.02) {
+        fprintf(stderr, "[test-slot-mmvq] %s: mismatch max_abs=%.8f rms=%.8f\n", name, max_abs, rms);
+        return false;
+    }
+
+    printf("[test-slot-mmvq] %s OK max_abs=%.8f rms=%.8f\n", name, max_abs, rms);
+    return true;
+}
+
 bool run_cuda_case(const char * name, ggml_backend_t backend, ggml_type type,
-        int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens, bool enable_mmvq) {
+        int64_t k, int64_t m, int64_t n_slots, int64_t n_used, int64_t n_tokens, bool enable_mmvq, bool enable_graphs = false) {
     set_slot_mmvq_env(enable_mmvq);
+    set_slot_graphs_env(enable_graphs);
 
     graph_case gc = build_case(type, k, m, n_slots, n_used, n_tokens);
     if (!gc.ctx) {
@@ -193,27 +230,67 @@ bool run_cuda_case(const char * name, ggml_backend_t backend, ggml_type type,
     std::vector<float> out((size_t) ggml_nelements(gc.out));
     ggml_backend_tensor_get(gc.out, out.data(), 0, out.size()*sizeof(float));
 
-    double max_abs = 0.0;
-    double rms = 0.0;
-    for (size_t i = 0; i < out.size(); ++i) {
-        const double diff = (double) out[i] - (double) data.reference[i];
-        max_abs = std::max(max_abs, std::abs(diff));
-        rms += diff*diff;
-    }
-    rms = std::sqrt(rms / std::max<size_t>(out.size(), 1));
+    const bool ok = check_output(name, out, data.reference);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(gc.ctx);
+    return ok;
+}
 
-    // Q4_0 accumulation differences are expected; this gate catches indexing
-    // and layout mistakes without requiring bit-identical CUDA/CPU arithmetic.
-    if (max_abs > 0.08 || rms > 0.02) {
-        fprintf(stderr, "[test-slot-mmvq] %s: mismatch max_abs=%.8f rms=%.8f\n", name, max_abs, rms);
+bool run_cuda_graph_replay_case(const char * name, ggml_backend_t backend, ggml_type type,
+        int64_t k, int64_t m, int64_t n_slots, int64_t n_used) {
+    set_slot_mmvq_env(true);
+    set_slot_graphs_env(true);
+
+    graph_case gc = build_case(type, k, m, n_slots, n_used, 1);
+    if (!gc.ctx) {
+        fprintf(stderr, "[test-slot-mmvq] %s: ggml_init failed\n", name);
         return false;
     }
 
-    printf("[test-slot-mmvq] %s OK max_abs=%.8f rms=%.8f\n", name, max_abs, rms);
-    return true;
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(gc.ctx, backend);
+    if (!buffer) {
+        ggml_free(gc.ctx);
+        fprintf(stderr, "[test-slot-mmvq] %s: tensor allocation failed\n", name);
+        return false;
+    }
+
+    bool ok = true;
+    for (int iter = 0; iter < 5; ++iter) {
+        tensor_data data;
+        fill_data(data, type, k, m, n_slots, n_used, 1, iter);
+        if (!compute_reference(data, type, k, m, n_used, 1)) {
+            fprintf(stderr, "[test-slot-mmvq] %s: reference conversion unavailable\n", name);
+            ok = false;
+            break;
+        }
+
+        ggml_backend_tensor_set(gc.as, data.as_quant.data(), 0, data.as_quant.size());
+        ggml_backend_tensor_set(gc.b, data.b.data(), 0, data.b.size()*sizeof(float));
+        ggml_backend_tensor_set(gc.ids, data.ids.data(), 0, data.ids.size()*sizeof(int32_t));
+
+        const ggml_status status = ggml_backend_graph_compute(backend, gc.gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[test-slot-mmvq] %s iter=%d: graph compute failed: %s\n",
+                    name, iter, ggml_status_to_string(status));
+            ok = false;
+            break;
+        }
+
+        std::vector<float> out((size_t) ggml_nelements(gc.out));
+        ggml_backend_tensor_get(gc.out, out.data(), 0, out.size()*sizeof(float));
+
+        char iter_name[128];
+        snprintf(iter_name, sizeof(iter_name), "%s iter=%d", name, iter);
+        if (!check_output(iter_name, out, data.reference)) {
+            ok = false;
+            break;
+        }
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(gc.ctx);
+    return ok;
 }
 
 } // namespace
@@ -244,10 +321,12 @@ int main() {
     bool ok = true;
     ok = run_cuda_case("decode generic sorted", backend, type, k, m, n_slots, n_used, 1, false) && ok;
     ok = run_cuda_case("decode guarded MMVQ", backend, type, k, m, n_slots, n_used, 1, true) && ok;
-    ok = run_cuda_case("prefill guard fallback", backend, type, k, m, n_slots, n_used, 4, true) && ok;
+    ok = run_cuda_graph_replay_case("decode guarded MMVQ graphs", backend, type, k, m, n_slots, n_used) && ok;
+    ok = run_cuda_case("prefill guard fallback", backend, type, k, m, n_slots, n_used, 4, true, true) && ok;
 
     ggml_backend_free(backend);
     set_slot_mmvq_env(false);
+    set_slot_graphs_env(false);
 
     return ok ? 0 : 1;
 #endif

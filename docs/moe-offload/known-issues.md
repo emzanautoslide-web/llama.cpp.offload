@@ -1,6 +1,6 @@
 # MoE Offload Known Issues
 
-Status as of the guarded Phase E validation on 2026-06-12.
+Status as of the guarded Phase F validation on 2026-06-12.
 
 ## Open
 
@@ -23,8 +23,9 @@ Current status:
 - Async-H2D diagnostics, forced no-hit reloads, identity slot-table fill, and
   compute synchronization diagnostics did not fix the chat issue.
 - Raw-completion golden-logit gates have passed at larger ubatches, including
-  the Phase E `LLAMA_MOE_SLOT_MMVQ=1` gate. That does not close the chat-prefill
-  issue because the failing surface is formatted interactive chat.
+  the Phase F `LLAMA_MOE_SLOT_MMVQ=1` + `LLAMA_MOE_SLOT_GRAPHS=1` gate. That
+  does not close the chat-prefill issue because the failing surface is
+  formatted interactive chat.
 
 Mitigation:
 
@@ -100,20 +101,25 @@ Impact:
 ### Specialized `.slot` `MUL_MAT_ID` Paths Are Mostly Bypassed
 
 By default, CUDA `MUL_MAT_ID` on `.slot` tensors still uses the generic sorted
-CUDA path. Phase E added one guarded exception:
-`LLAMA_MOE_SLOT_MMVQ=1` enables quantized single-token `.slot` MMVQ decode.
+CUDA path. Phase E added guarded quantized single-token `.slot` MMVQ decode
+with `LLAMA_MOE_SLOT_MMVQ=1`; Phase F added optional CUDA graph capture for
+that same decode shape with `LLAMA_MOE_SLOT_GRAPHS=1`.
 
 Current status:
 
 - The default remains correctness-first.
-- The guarded MMVQ decode path passed the synthetic CUDA test, golden-logit
-  gate, chat smoke, and the 8000 MiB EAMC benchmark on the 2026-06-12 dev-box
-  run.
+- The guarded MMVQ + graph decode path passed the synthetic CUDA graph replay
+  test, golden-logit gate, chat smoke, and the 8000 MiB EAMC benchmark on the
+  2026-06-12 dev-box run.
 - The Phase E benchmark improved TTFT from 19704.8 ms to 18481.0 ms and TPOT
   from 62.13 ms/token to 47.20 ms/token versus Phase D; H2D, stall, predictor
   time, SSD read time, callback wall time, and hit rates were flat or better.
-- `.slot` MMQ/MMF, multi-token prefill fast paths, CUDA graph capture, and
-  fusion remain bypassed or disabled until separately validated.
+- The Phase F benchmark improved TPOT from 47.20 ms/token to 30.63 ms/token
+  and decode `compute_us` from 24.34 ms/token to 10.46 ms/token versus Phase E.
+  This benchmark used the static validation build because the shared CUDA DLL
+  was blocked by Windows Smart App Control.
+- `.slot` MMQ/MMF, multi-token prefill fast paths, generic sorted graph
+  capture, and fusion remain bypassed or disabled until separately validated.
 
 ### EAMC Row Caps Are Diagnostic Only
 
@@ -136,9 +142,22 @@ an approximation of overlap loss rather than a pure GPU timeline metric.
 On the 2026-06-12 Perf-D dev-box run, Windows Application Control blocked the
 freshly rebuilt compressed `ggml-cuda.dll` with status `0xc0e90002`.
 Configuring `build-moe` with `-DGGML_CUDA_COMPRESSION_MODE=none` produced a
-loadable CUDA backend for benchmarking. The same policy can block freshly
-rebuilt unsigned test executables, which affected `test-cuda-stream.exe` during
-CTest validation.
+loadable CUDA backend for benchmarking.
+
+During Phase F, Smart App Control later blocked the rebuilt shared
+`build-moe\bin\Release\ggml-cuda.dll` even with compression disabled. The
+symptom is `llama-cli.exe` or `llama-moe-bench.exe` exiting immediately with
+`0xc0e90002` while Code Integrity logs that the process attempted to load
+`ggml-cuda.dll` and it did not meet Enterprise signing requirements. The local
+dev-box workaround was to use a static CUDA validation build and copy the
+static `llama-cli.exe`, `llama-moe-bench.exe`, and `llama-completion.exe` into
+`build-moe\bin\Release`; the original shared launchers were backed up under
+`build-moe\bin\Release\shared-launcher-backup-phase-f-*`.
+
+The same policy can block freshly rebuilt unsigned test executables, which
+affected `test-cuda-stream.exe` during CTest validation.
+
+The fix is to disable Windows Application Control in Settings--Privacy Settings--Security Settings
 
 ## Deferred
 
@@ -242,15 +261,18 @@ Phase D removed the normal per-completion `cudaEventSynchronize()` from pinned
 H2D buffer recycling. The compute stream still waits on each H2D completion
 event for correctness, but pinned buffers are now returned to the pool after
 nonblocking event polling reports completion. Decode `stall_us` fell from about
-16.8 ms/token to 0.41 ms/token in Phase D and 0.12 ms/token in Phase E.
+16.8 ms/token to 0.41 ms/token in Phase D, 0.12 ms/token in Phase E, and about
+0.13 ms/token in the Phase F graph run.
 
 ### Guarded `.slot` MMVQ Decode Validation
 
 Phase E restored quantized single-token `.slot` MMVQ decode behind
-`LLAMA_MOE_SLOT_MMVQ=1`. The default remains generic sorted CUDA, but the
-guarded path passed:
+`LLAMA_MOE_SLOT_MMVQ=1`. Phase F then enabled CUDA graph capture for the same
+decode-only path behind `LLAMA_MOE_SLOT_GRAPHS=1`. The default remains generic
+sorted CUDA, but the guarded paths passed:
 
 - synthetic CUDA `test-slot-mmvq`,
+- repeated graph replay with changing slot ids and slot contents,
 - golden-logit gate with `max|d|=0`,
 - `llama-cli` chat smoke,
 - 8000 MiB EAMC benchmark with faster TTFT and TPOT.

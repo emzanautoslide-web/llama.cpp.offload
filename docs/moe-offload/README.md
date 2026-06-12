@@ -48,9 +48,10 @@ Set `LLAMA_MOE_STREAMING_UBATCH=N` only for diagnostics while the batched path
 remains under investigation.
 
 Set `LLAMA_MOE_SLOT_MMVQ=1` to enable the guarded CUDA `.slot` quantized
-single-token MMVQ decode fast path. It is off by default; MMQ/MMF,
-multi-token prefill fast paths, CUDA graph capture, and fusion remain disabled
-for `.slot` tensors pending separate validation.
+single-token MMVQ decode fast path. Set `LLAMA_MOE_SLOT_GRAPHS=1` as well to
+enable CUDA graph capture for that same guarded decode shape. Both are off by
+default; MMQ/MMF, multi-token prefill fast paths, generic sorted graph capture,
+and fusion remain disabled for `.slot` tensors pending separate validation.
 
 Use `llama-completion -no-cnv` for raw completion and logit diagnostics. Avoid
 using `-p "Hello"` as a system prompt in conversation mode; it seeds the
@@ -113,6 +114,12 @@ after prefill and after each completed repeat, so the file appears before the
 full benchmark finishes. It intentionally does not use the runtime
 `end_request()` summary writer, which emits the older aggregate-only format. If
 `--moe-profile-csv` is set, a per-layer profile CSV is written to that path.
+
+Set `LLAMA_MOE_SLOT_MMVQ=1` to enable the guarded CUDA `.slot` quantized
+single-token MMVQ decode fast path. Set `LLAMA_MOE_SLOT_GRAPHS=1` as well to
+enable CUDA graph capture for that same guarded decode shape. Both are off by
+default; MMQ/MMF, multi-token prefill fast paths, generic sorted graph capture,
+and fusion remain disabled for `.slot` tensors pending separate validation.
 
 Example summary:
 ```
@@ -230,9 +237,10 @@ Implemented in this slice:
 - **Perf-C**: EAMC scoring uses sparse corpus rows, an inverted `(layer, expert)` index for dense-equivalent uncapped cosine scoring, lazy per-callback score-vector materialization, and profiler counters for cosine/materialization/cache activity. Corpus row caps remain diagnostic-only through `LLAMA_MOE_EAMC_ROWS=N`.
 - **Perf-D**: Async H2D pinned buffers are no longer recycled by synchronizing the host on every copy event. The compute stream still waits on each H2D end event for correctness; pinned buffers are tracked in an inflight list and returned to the pool after `io_event_query()` reports completion. Miss submissions are sorted by file offset. On the 8000 MiB EAMC benchmark this cut decode `stall_us` from about 16.8 ms/token to 0.41 ms/token, but TPOT did not improve because SSD/callback time rose in that run.
 - **Perf-E**: `LLAMA_MOE_SLOT_MMVQ=1` restores only the guarded quantized single-token `.slot` MMVQ decode path. On the 8000 MiB EAMC benchmark this improved TTFT from 19704.8 ms to 18481.0 ms and TPOT from 62.13 ms/token to 47.20 ms/token versus Phase D; H2D, stall, predictor time, SSD read time, callback wall time, and hit rates were flat or better.
+- **Perf-F**: `LLAMA_MOE_SLOT_GRAPHS=1` enables CUDA graph capture only for the guarded `.slot` MMVQ decode path. On the 8000 MiB EAMC benchmark this improved TPOT from 47.20 ms/token to 30.63 ms/token versus Phase E and reduced decode `compute_us` from 24.34 ms/token to 10.46 ms/token; H2D, stall, predictor time, SSD read time, callback wall time, and hit rates were flat or better.
 - **J**: `--logit-dump PATH` on `llama-completion`, `tests/moe-offload/compare_logits.py`, and PowerShell harness `tests/moe-offload/test-golden-logits.ps1`. See "Correctness" below.
-- **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke, the Phase E `test-slot-mmvq` CUDA micro-test, and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
-- **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. By default CUDA `MUL_MAT_ID` on `.slot` tensors uses the generic sorted path for correctness-first validation. The guarded decode-only MMVQ path is available through `LLAMA_MOE_SLOT_MMVQ=1`; MMQ/MMF, multi-token prefill fast paths, CUDA graph capture, and fusion remain disabled for `.slot`.
+- **K**: C++ unit tests registered with CTest under label `moe-offload` (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`, `test-repack-slices`) alongside Phase G's `test-cuda-stream` smoke, the Phase E/F `test-slot-mmvq` CUDA micro-test, and the `test-moe-oracle-failfast` CLI test. Run with `ctest --test-dir build-moe -C Release -L moe-offload`.
+- **MVP closeout**: Streaming slot tensors now default to the actual cache slot count; set `LLAMA_MOE_FULL_EXPERT_AXIS=1` only as a guarded fallback. By default CUDA `MUL_MAT_ID` on `.slot` tensors uses the generic sorted path for correctness-first validation. The guarded decode-only MMVQ path is available through `LLAMA_MOE_SLOT_MMVQ=1`, with decode-only CUDA graphs additionally gated by `LLAMA_MOE_SLOT_GRAPHS=1`; MMQ/MMF, multi-token prefill fast paths, generic sorted graph capture, and fusion remain disabled for `.slot`.
 - **L**: IO worker shutdown wired into `llama_context::~llama_context()`; small-cache and multi-token-prompt streaming deadlocks fixed by excluding just-reserved experts from LRU/predictor eviction within the same callback. Larger-ubatch miss loading now submits and drains I/O in chunks instead of requiring the pinned-buffer pool to cover every blob for the layer.
 
 ## Correctness
@@ -287,9 +295,9 @@ but that alone did not move the measured drift. Remaining hypotheses:
 The June 5 closeout changes addressed the two leading runtime suspects from
 this section: slot tensors now use the actual cache slot count by default, and
 CUDA `MUL_MAT_ID` on `.slot` tensors uses the generic sorted path by default.
-The Phase E guarded MMVQ decode path also passed the golden-logit harness on
-2026-06-12 with `LLAMA_MOE_SLOT_MMVQ=1`, cache=8000 MiB, `-n 32`, `-ub 8`, and
-`max|d|=0`.
+The Phase F guarded MMVQ + graph decode path also passed the golden-logit
+harness on 2026-06-12 with `LLAMA_MOE_SLOT_MMVQ=1`,
+`LLAMA_MOE_SLOT_GRAPHS=1`, cache=8000 MiB, `-n 32`, `-ub 8`, and `max|d|=0`.
 
 Deviations from the source plan (`implementation_plan_mvp_20260529.md` §3):
 
@@ -321,7 +329,7 @@ CTest targets under label `moe-offload`:
 | Test | Phase | Purpose |
 |---|---|---|
 | `test-cuda-stream` | G | Pinned alloc + async H2D + event ordering smoke. |
-| `test-slot-mmvq` | Perf-E | Synthetic CUDA `.slot` Q4_0 `MUL_MAT_ID` check for generic sorted decode, guarded MMVQ decode, and guarded prefill fallback. Registered only when the CUDA backend target is available. |
+| `test-slot-mmvq` | Perf-E/F | Synthetic CUDA `.slot` Q4_0 `MUL_MAT_ID` check for generic sorted decode, guarded MMVQ decode, guarded MMVQ graph replay with changing slot ids/contents, and guarded prefill fallback. Registered only when the CUDA backend target is available. |
 | `test-eamc-cosine` | K / Perf-B / Perf-C | EAMC dense-equivalent scoring, sidecar round-trip, prefill-like repeated layer waves, and bounded FIFO/ring replacement on full insert. |
 | `test-lru-eviction` | K | Hand-computed LRU score values, victim ordering, per-layer isolation. |
 | `test-manifest-roundtrip` | K | GGUF manifest sanity (version=2, table size, per-record file ranges). Self-skips with exit 0 when `LLAMA_MOE_TEST_GGUF` is unset. |
