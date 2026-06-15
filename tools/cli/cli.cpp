@@ -9,9 +9,20 @@
 #include "server-context.h"
 #include "server-task.h"
 
+#ifdef LLAMA_MOE_OFFLOAD
+#include "../../src/moe-offload/runtime.h"
+
+namespace llama_moe {
+LLAMA_API uint32_t n_slots_per_layer();
+LLAMA_API uint32_t n_experts_per_layer();
+LLAMA_API bool     streaming_mode();
+}
+#endif
+
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -344,6 +355,76 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
 
 static constexpr size_t FILE_GLOB_MAX_RESULTS = 100;
 
+#ifdef LLAMA_MOE_OFFLOAD
+static void llama_cli_moe_set_env(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+static void llama_cli_moe_apply_fast_paths() {
+    llama_cli_moe_set_env("LLAMA_MOE_SLOT_MMVQ", "1");
+    llama_cli_moe_set_env("LLAMA_MOE_SLOT_GRAPHS", "1");
+    llama_cli_moe_set_env("LLAMA_MOE_SLOT_GLU_FUSION", "1");
+    llama_cli_moe_set_env("LLAMA_MOE_PREFILL_MMVQ", "0");
+    llama_cli_moe_set_env("LLAMA_MOE_TOPK_FUSION_DIAG", "0");
+}
+
+struct llama_cli_moe_timing_totals {
+    int prompt_n = 0;
+    int predicted_n = 0;
+    double prompt_ms = 0.0;
+    double predicted_ms = 0.0;
+};
+
+static std::string llama_cli_moe_storage_label(const std::string & path) {
+    if (path.size() >= 2 && path[1] == ':') {
+        return path.substr(0, 2);
+    }
+    return "";
+}
+
+static void llama_cli_moe_write_summary(
+        const common_params & params,
+        llama_context * ctx,
+        const server_context_meta & meta,
+        const llama_cli_moe_timing_totals & totals) {
+    if (!params.moe_offload || params.moe_profile_summary.empty() || !ctx) {
+        return;
+    }
+
+    llama_moe::profile_summary_context summary_ctx;
+    summary_ctx.model = meta.model_name.empty() ? std::filesystem::path(params.model.path).filename().string() : meta.model_name;
+    summary_ctx.predictor = params.moe_predictor;
+    summary_ctx.storage = llama_cli_moe_storage_label(params.model.path);
+    summary_ctx.cache_mb = (uint64_t) std::max(0, params.moe_cache_vram_mb);
+    summary_ctx.n_prompt = totals.prompt_n;
+    summary_ctx.n_gen = totals.predicted_n;
+    summary_ctx.n_repeat = 1;
+    summary_ctx.n_ubatch_requested = params.n_ubatch;
+    summary_ctx.n_ubatch = (int) llama_n_ubatch(ctx);
+    summary_ctx.n_slots = llama_moe::n_slots_per_layer();
+    summary_ctx.n_experts = llama_moe::n_experts_per_layer();
+    summary_ctx.streaming = llama_moe::streaming_mode();
+    summary_ctx.ttft_ms = totals.prompt_ms;
+    summary_ctx.tpot_ms = totals.predicted_n > 0 ? totals.predicted_ms / (double) totals.predicted_n : 0.0;
+    summary_ctx.total_ms = totals.prompt_ms + totals.predicted_ms;
+
+    const std::string summary = llama_moe::format_summary(summary_ctx, llama_moe::get_profile_snapshot());
+    std::ofstream out(params.moe_profile_summary, std::ios::out | std::ios::trunc);
+    if (!out) {
+        fprintf(stderr, "llama-cli: failed to write MoE profile summary: %s\n", params.moe_profile_summary.c_str());
+        return;
+    }
+    out << summary;
+    if (!out) {
+        fprintf(stderr, "llama-cli: failed while writing MoE profile summary: %s\n", params.moe_profile_summary.c_str());
+    }
+}
+#endif
+
 // satisfies -Wmissing-declarations
 int llama_cli(int argc, char ** argv);
 
@@ -359,12 +440,23 @@ int llama_cli(int argc, char ** argv) {
     }
 
 #ifdef LLAMA_MOE_OFFLOAD
-    if (params.moe_offload && std::getenv("LLAMA_MOE_STREAMING_UBATCH") == nullptr) {
-        // The current streaming slot path is correct for decode/single-token
-        // prefill, but batched chat prefill can corrupt Qwen MoE responses.
-        // Keep interactive chat correctness-first by default; diagnostics can
-        // still force a larger value via LLAMA_MOE_STREAMING_UBATCH=N.
-        params.n_ubatch = 1;
+    if (params.moe_offload) {
+        if (params.moe_fast_paths) {
+            llama_cli_moe_apply_fast_paths();
+            fprintf(stderr,
+                    "llama-cli: MoE fast paths enabled "
+                    "(slot_mmvq=1, slot_graphs=1, slot_glu_fusion=1, prefill_mmvq=0, topk_fusion_diag=0)\n");
+        } else if (std::getenv("LLAMA_MOE_STREAMING_UBATCH") == nullptr) {
+            // Keep the default interactive path correctness-first. The
+            // documented fast profile opts into runtime auto-sizing instead.
+            params.n_ubatch = 1;
+        }
+
+        if (params.moe_fast_paths && std::getenv("LLAMA_MOE_STREAMING_UBATCH") == nullptr) {
+            fprintf(stderr, "llama-cli: MoE fast paths using streaming ubatch auto-sizing\n");
+        } else if (!params.moe_fast_paths && std::getenv("LLAMA_MOE_STREAMING_UBATCH") == nullptr) {
+            fprintf(stderr, "llama-cli: MoE default path forcing n_ubatch=1; use --moe-fast-paths for the validated fast profile\n");
+        }
     }
 #endif
 
@@ -410,6 +502,13 @@ int llama_cli(int argc, char ** argv) {
     }
 
     console::spinner::stop();
+#ifdef LLAMA_MOE_OFFLOAD
+    if (params.moe_offload) {
+        fprintf(stderr, "llama-cli: MoE effective n_ubatch=%u%s\n",
+                llama_n_ubatch(ctx_cli.ctx_server.get_llama_context()),
+                params.moe_fast_paths ? " (fast paths)" : "");
+    }
+#endif
     console::log("\n");
 
     std::thread inference_thread([&ctx_cli]() {
@@ -457,6 +556,10 @@ int llama_cli(int argc, char ** argv) {
         console::log("  /audio <file>       add an audio file\n");
     }
     console::log("\n");
+
+#ifdef LLAMA_MOE_OFFLOAD
+    llama_cli_moe_timing_totals moe_timing_totals;
+#endif
 
     // interactive loop
     std::string cur_msg;
@@ -635,6 +738,12 @@ int llama_cli(int argc, char ** argv) {
         }
         result_timings timings;
         std::string assistant_content = ctx_cli.generate_completion(timings);
+#ifdef LLAMA_MOE_OFFLOAD
+        moe_timing_totals.prompt_n += timings.prompt_n;
+        moe_timing_totals.predicted_n += timings.predicted_n;
+        moe_timing_totals.prompt_ms += timings.prompt_ms;
+        moe_timing_totals.predicted_ms += timings.predicted_ms;
+#endif
         ctx_cli.messages.push_back({
             {"role",    "assistant"},
             {"content", assistant_content}
@@ -662,6 +771,10 @@ int llama_cli(int argc, char ** argv) {
     // bump the log level to display timings
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);
     common_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
+
+#ifdef LLAMA_MOE_OFFLOAD
+    llama_cli_moe_write_summary(params, ctx_cli.ctx_server.get_llama_context(), inf, moe_timing_totals);
+#endif
 
     return 0;
 }

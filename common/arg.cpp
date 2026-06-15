@@ -2279,6 +2279,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-fast-paths"},
+        "enable the accepted MoE offload fast-path profile for interactive CLI runs",
+        [](common_params & params) {
+            params.moe_fast_paths = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}).set_env("LLAMA_MOE_FAST_PATHS"));
+    add_opt(common_arg(
         {"--moe-cache-vram-mb"}, "N",
         "VRAM budget for the MoE expert cache, in MiB",
         [](common_params & params, int value) {

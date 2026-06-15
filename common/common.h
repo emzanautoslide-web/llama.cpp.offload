@@ -559,6 +559,7 @@ struct common_params {
 
 #ifdef LLAMA_MOE_OFFLOAD
     bool        moe_offload            = false;
+    bool        moe_fast_paths         = false;
     int32_t     moe_cache_vram_mb      = 0;
     float       moe_cache_vram_frac    = 0.0f;
     std::string moe_predictor          = "lru";

@@ -369,13 +369,20 @@ std::string format_summary(
     out << "  profiled_decode_us    " << profiled_decode_us << '\n';
     out << "  unattributed_decode_us " << unattributed_decode_us << "\n\n";
 
-    out << "VRAM peak: " << std::setprecision(2) << vram_peak_gib << " GB";
-    if (ctx.vram_total_bytes > 0) {
-        out << " / " << bytes_to_gib(ctx.vram_total_bytes) << " GB";
+    if (ctx.vram_peak_bytes > 0 || ctx.vram_total_bytes > 0) {
+        out << "VRAM peak: " << std::setprecision(2) << vram_peak_gib << " GB";
+        if (ctx.vram_total_bytes > 0) {
+            out << " / " << bytes_to_gib(ctx.vram_total_bytes) << " GB";
+        }
+        out << "  (experts budget: " << expert_cache_gib
+            << " GB, other model/kv/compute: " << vram_other_gib << " GB)\n";
+    } else {
+        out << "VRAM peak: unavailable"
+            << "  (experts budget: " << expert_cache_gib << " GB)\n";
     }
-    out << "  (experts budget: " << expert_cache_gib
-        << " GB, other model/kv/compute: " << vram_other_gib << " GB)\n";
-    out << "DRAM peak (process): " << bytes_to_gib(ctx.dram_peak_bytes) << " GB\n";
+    if (ctx.dram_peak_bytes > 0) {
+        out << "DRAM peak (process): " << bytes_to_gib(ctx.dram_peak_bytes) << " GB\n";
+    }
     out << "SSD reads: " << profile.decode.ssd_reads
         << " (avg " << avg_read_mib << " MB each, avg latency " << avg_read_latency_ms << " ms)\n";
     out << "profile rows: prefill=" << profile.prefill.rows << " decode=" << profile.decode.rows << '\n';
