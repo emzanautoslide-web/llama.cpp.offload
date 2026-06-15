@@ -305,6 +305,7 @@ extern "C" {
     GGML_BACKEND_API void   moe_io_cuda_event_release(void * ev);
     GGML_BACKEND_API bool   moe_io_cuda_compute_wait (ggml_backend_t backend, void * ev);
     GGML_BACKEND_API bool   moe_io_cuda_event_sync   (void * ev);
+    GGML_BACKEND_API bool   moe_io_cuda_event_query  (void * ev);
     GGML_BACKEND_API size_t moe_io_cuda_events_in_use(void);
     GGML_BACKEND_API void * moe_io_cuda_event_acquire (void);
     GGML_BACKEND_API bool   moe_io_cuda_record_on_h2d (void * ev);
@@ -322,6 +323,7 @@ bool   io_h2d_async   (void * d, const void * s, size_t n,
 void   io_event_release(void * ev)                         { moe_io_cuda_event_release(ev); }
 bool   io_compute_wait(ggml_backend_t b, void * ev)        { return moe_io_cuda_compute_wait(b, ev); }
 bool   io_event_sync  (void * ev)                          { return moe_io_cuda_event_sync(ev); }
+bool   io_event_query (void * ev)                          { return moe_io_cuda_event_query(ev); }
 size_t io_events_in_use()                                  { return moe_io_cuda_events_in_use(); }
 bool   io_h2d_async_timed(void * d, const void * s, size_t n,
                           void ** evb, void ** eve)        { return moe_io_cuda_h2d_async_timed(d, s, n, evb, eve); }
@@ -338,6 +340,7 @@ bool   io_h2d_async   (void *, const void *, size_t, void **) { return false; }
 void   io_event_release(void *)                            { }
 bool   io_compute_wait(ggml_backend_t, void *)             { return false; }
 bool   io_event_sync  (void *)                             { return false; }
+bool   io_event_query (void *)                             { return false; }
 size_t io_events_in_use()                                  { return 0; }
 bool   io_h2d_async_timed(void *, const void *, size_t, void **, void **) { return false; }
 void * io_event_acquire ()                                 { return nullptr; }

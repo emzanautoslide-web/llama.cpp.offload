@@ -104,6 +104,50 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
 
+static bool ggml_cuda_is_moe_slot_tensor(const ggml_tensor * tensor) {
+    return tensor && std::strstr(tensor->name, ".slot") != nullptr;
+}
+
+static bool ggml_cuda_moe_slot_mmvq_enabled() {
+    const char * env = getenv("LLAMA_MOE_SLOT_MMVQ");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool ggml_cuda_moe_prefill_mmvq_enabled() {
+    const char * env = getenv("LLAMA_MOE_PREFILL_MMVQ");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool ggml_cuda_moe_slot_graphs_enabled() {
+    const char * env = getenv("LLAMA_MOE_SLOT_GRAPHS");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool ggml_cuda_moe_slot_glu_fusion_enabled() {
+    const char * env = getenv("LLAMA_MOE_SLOT_GLU_FUSION");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool ggml_cuda_moe_topk_fusion_diag_enabled() {
+    const char * env = getenv("LLAMA_MOE_TOPK_FUSION_DIAG");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool ggml_cuda_moe_topk_fusion_enabled(const ggml_tensor * logits = nullptr) {
+#ifdef LLAMA_MOE_OFFLOAD
+    if (!ggml_cuda_moe_topk_fusion_diag_enabled()) {
+        return false;
+    }
+    // Phase H diagnostic only: keep the normal offload path unchanged and
+    // constrain the fused path to single-token decode until the full validation
+    // matrix passes.
+    return logits == nullptr || ggml_nrows(logits) == 1;
+#else
+    GGML_UNUSED(logits);
+    return true;
+#endif
+}
+
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
 void ggml_cuda_set_device(int device) {
@@ -121,6 +165,42 @@ int ggml_cuda_get_device() {
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
     return id;
+}
+
+static bool ggml_cuda_moe_slot_glu_fusion_tensor_compatible(const ggml_tensor * tensor) {
+    if (!ggml_cuda_moe_slot_glu_fusion_enabled() || !ggml_cuda_moe_slot_mmvq_enabled()) {
+        return false;
+    }
+
+    if (!tensor || tensor->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = tensor->src[0];
+    const ggml_tensor * src1 = tensor->src[1];
+    const ggml_tensor * ids  = tensor->src[2];
+
+    if (!src0 || !src1 || !ids || !ggml_cuda_is_moe_slot_tensor(src0)) {
+        return false;
+    }
+
+    if (!ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 ||
+            ids->type != GGML_TYPE_I32 || tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // Keep Phase G decode-only: prefill/multi-token fusion is deferred.
+    if (tensor->ne[2] != 1) {
+        return false;
+    }
+
+    if (src1->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+    return tensor->ne[2] <= mmvq_mmid_max;
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -2398,6 +2478,21 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    if (is_mul_mat_id) {
+        const bool up_slot   = ggml_cuda_is_moe_slot_tensor(ffn_up->src[0]);
+        const bool gate_slot = ggml_cuda_is_moe_slot_tensor(ffn_gate->src[0]);
+
+        if (up_slot || gate_slot) {
+            if (!up_slot || !gate_slot) {
+                return false;
+            }
+            if (!ggml_cuda_moe_slot_glu_fusion_tensor_compatible(ffn_up) ||
+                    !ggml_cuda_moe_slot_glu_fusion_tensor_compatible(ffn_gate)) {
+                return false;
+            }
+        }
+    }
+
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
     if (has_bias) {
@@ -2470,6 +2565,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
+    if (is_mul_mat_id && ggml_cuda_is_moe_slot_tensor(src0)) {
+        return false;
+    }
+
     bool use_mul_mat_vec_f =
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
@@ -2498,10 +2597,16 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool allow_moe_slot_glu = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_cuda_is_moe_slot_tensor(src0)) {
+        if (!allow_moe_slot_glu || !ggml_cuda_moe_slot_glu_fusion_tensor_compatible(tensor)) {
+            return false;
+        }
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2638,10 +2743,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool moe_slot_tensor = std::strstr(src0->name, ".slot") != nullptr;
+    const bool moe_slot_tensor = ggml_cuda_is_moe_slot_tensor(src0);
+    const bool use_moe_slot_mmvq = moe_slot_tensor && ggml_cuda_moe_slot_mmvq_enabled() &&
+        ggml_is_quantized(src0->type) &&
+        (ne2 == 1 || (ne2 > 1 && ggml_cuda_moe_prefill_mmvq_enabled()));
+    const bool use_specialized_mul_mat_id = !moe_slot_tensor || use_moe_slot_mmvq;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (!moe_slot_tensor && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (use_specialized_mul_mat_id && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -2651,21 +2760,27 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (!moe_slot_tensor && GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
-            return;
-        }
+        if (moe_slot_tensor) {
+            // Slot MMVQ is guarded separately for decode and multi-token prefill.
+            // MMQ/MMF and broader fusion remain separate validation steps.
+            GGML_ASSERT(use_moe_slot_mmvq);
+        } else {
+            if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+                ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+                return;
+            }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
-            return;
+            if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+                ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+                return;
+            }
         }
     }
 
@@ -3246,6 +3361,41 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 }
 
 #ifdef USE_CUDA_GRAPH
+static bool ggml_cuda_moe_slot_mmvq_graph_compatible(const ggml_tensor * node, int cc) {
+    GGML_ASSERT(node);
+    GGML_ASSERT(node->op == GGML_OP_MUL_MAT_ID);
+
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const ggml_tensor * ids  = node->src[2];
+
+    if (!ggml_cuda_moe_slot_graphs_enabled() || !ggml_cuda_moe_slot_mmvq_enabled()) {
+        return false;
+    }
+
+    if (!ggml_cuda_is_moe_slot_tensor(src0)) {
+        return false;
+    }
+
+    if (!src1 || !ids || src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || node->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (!ggml_is_quantized(src0->type)) {
+        return false;
+    }
+
+    // Phase F only admits the decode shape already validated by the guarded
+    // MMVQ path. Prefill/multi-token slot graphs continue to use the generic
+    // path without CUDA graph capture.
+    if (node->ne[2] != 1) {
+        return false;
+    }
+
+    const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+    return node->ne[2] <= mmvq_mmid_max;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3269,14 +3419,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            const bool moe_slot_tensor = node->src[0] && std::strstr(node->src[0]->name, ".slot") != nullptr;
+            const bool moe_slot_tensor = ggml_cuda_is_moe_slot_tensor(node->src[0]);
             if (moe_slot_tensor) {
-                // The MVP MoE slot path intentionally bypasses the specialized
-                // MUL_MAT_ID kernels and uses the generic sorted path, which
-                // performs host/device synchronization.
-                use_cuda_graph = false;
+                const bool slot_graph_compatible = ggml_cuda_moe_slot_mmvq_graph_compatible(node, cc);
+                if (!slot_graph_compatible) {
+                    use_cuda_graph = false;
+                }
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to MoE slot tensor\n", __func__);
+                if (!slot_graph_compatible) {
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported MoE slot tensor\n", __func__);
+                }
 #endif
             } else if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
@@ -3406,13 +3558,13 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
-#ifndef LLAMA_MOE_OFFLOAD
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.softmax         = false;
     args.delayed_softmax = false;
     args.prob_bias       = false;
     args.norm            = false;
+    args.scale           = false;
 
     const int      n_nodes = cgraph->n_nodes;
     ggml_tensor ** nodes   = cgraph->nodes;
@@ -3552,7 +3704,6 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 
     return true;
 }
-#endif
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
@@ -3850,14 +4001,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     //topk-moe
-#ifndef LLAMA_MOE_OFFLOAD
-    if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
-            cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+    if (ggml_cuda_moe_topk_fusion_enabled() &&
+            (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+             cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
 
-        if (can_fuse) {
+        if (can_fuse && ggml_cuda_moe_topk_fusion_enabled(node->src[0])) {
             const ggml_tensor * logits  = node->src[0];
             ggml_tensor *       weights = nullptr;
             ggml_tensor *       ids     = nullptr;
@@ -3919,7 +4070,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
     }
-#endif
 
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
@@ -4081,7 +4231,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, /*allow_moe_slot_glu=*/ true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -4120,7 +4270,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*allow_moe_slot_glu=*/ true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);

@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -47,6 +48,9 @@ struct bench_params {
     int n_gpu_layers = 99;
     int n_ctx = 4096;
     int n_ubatch = 0;
+    bool moe_reset_cache_between_repeats = false;
+    bool moe_warm_cache = false;
+    bool moe_hot_start = false;
 };
 
 static bool parse_args(int argc, char ** argv, bench_params & p) {
@@ -87,6 +91,9 @@ static bool parse_args(int argc, char ** argv, bench_params & p) {
         else if (int_for("-ub", p.n_ubatch)) {}
         else if (int_for("--ubatch", p.n_ubatch)) {}
         else if (int_for("--ubatch-size", p.n_ubatch)) {}
+        else if (arg == "--moe-reset-cache-between-repeats") { p.moe_reset_cache_between_repeats = true; }
+        else if (arg == "--moe-warm-cache") { p.moe_warm_cache = true; }
+        else if (arg == "--moe-hot-start") { p.moe_hot_start = true; }
         else if (value_for("-p", p.prompt)) {}
     }
     if (p.n_repeat < 1) p.n_repeat = 1;
@@ -112,9 +119,90 @@ static double bytes_to_mib(double bytes) {
     return bytes / (1024.0 * 1024.0);
 }
 
+static std::vector<std::vector<int>> rank_hot_start_scores(
+        const std::vector<std::vector<double>> & scores,
+        int n_slots) {
+    std::vector<std::vector<int>> ranked(scores.size());
+    for (size_t layer = 0; layer < scores.size(); ++layer) {
+        std::vector<int> order(scores[layer].size());
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            return scores[layer][(size_t) a] > scores[layer][(size_t) b];
+        });
+        if (n_slots > 0 && (size_t) n_slots < order.size()) {
+            order.resize((size_t) n_slots);
+        }
+        ranked[layer] = std::move(order);
+    }
+    return ranked;
+}
+
+static std::vector<std::vector<int>> load_hot_start_from_eamc(
+        const std::string & path,
+        int n_experts,
+        int n_slots) {
+    std::vector<std::vector<int>> result;
+    if (path.empty() || n_experts <= 0) {
+        return result;
+    }
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return result;
+    }
+
+    char magic[4] = {};
+    uint32_t file_n_layers = 0;
+    uint32_t file_n_experts = 0;
+    uint64_t file_capacity = 0;
+    uint64_t file_top_k = 0;
+    uint64_t rows = 0;
+    in.read(magic, sizeof(magic));
+    in.read(reinterpret_cast<char *>(&file_n_layers), sizeof(file_n_layers));
+    in.read(reinterpret_cast<char *>(&file_n_experts), sizeof(file_n_experts));
+    in.read(reinterpret_cast<char *>(&file_capacity), sizeof(file_capacity));
+    in.read(reinterpret_cast<char *>(&file_top_k), sizeof(file_top_k));
+    in.read(reinterpret_cast<char *>(&rows), sizeof(rows));
+
+    if (!in || std::string(magic, 4) != "EAM1" ||
+            file_n_layers == 0 ||
+            file_n_experts != (uint32_t) n_experts ||
+            rows == 0 || file_capacity == 0 || file_top_k == 0) {
+        return {};
+    }
+
+    const int n_layers = (int) file_n_layers;
+    std::vector<std::vector<double>> scores((size_t) n_layers, std::vector<double>((size_t) n_experts, 0.0));
+    std::vector<float> row((size_t) n_layers * (size_t) n_experts);
+    for (uint64_t r = 0; r < rows; ++r) {
+        in.read(reinterpret_cast<char *>(row.data()), (std::streamsize) (row.size() * sizeof(float)));
+        if (!in) {
+            return {};
+        }
+        for (int layer = 0; layer < n_layers; ++layer) {
+            for (int expert = 0; expert < n_experts; ++expert) {
+                scores[(size_t) layer][(size_t) expert] +=
+                    row[(size_t) layer * (size_t) n_experts + (size_t) expert];
+            }
+        }
+    }
+
+    result = rank_hot_start_scores(scores, n_slots);
+    return result;
+}
+
 static std::string basename_of(const std::string & path) {
     const size_t pos = path.find_last_of("/\\");
     return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+static std::string default_eamc_path_of(const std::string & model_path) {
+    const size_t slash = model_path.find_last_of("/\\");
+    const size_t dot = model_path.find_last_of('.');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
+        return model_path.substr(0, dot) + ".eamc";
+    }
+    return model_path + ".eamc";
 }
 
 static std::string storage_label_of(const std::string & path) {
@@ -267,7 +355,7 @@ static llama_token greedy_token(llama_context * ctx, int vocab_size) {
 int main(int argc, char ** argv) {
     bench_params p;
     if (!parse_args(argc, argv, p)) {
-        fprintf(stderr, "Usage: llama-moe-bench --model <path> --pp N --tg N [--repeat N] [--moe-cache-vram-mb MB] [--moe-predictor lru|eamc] [--moe-eamc-path PATH] [--moe-profile-csv PATH] [--moe-profile-summary PATH] [-ub N]\n");
+        fprintf(stderr, "Usage: llama-moe-bench --model <path> --pp N --tg N [--repeat N] [--moe-cache-vram-mb MB] [--moe-predictor lru|eamc] [--moe-eamc-path PATH] [--moe-profile-csv PATH] [--moe-profile-summary PATH] [--moe-reset-cache-between-repeats] [--moe-warm-cache] [--moe-hot-start] [-ub N]\n");
         return 1;
     }
 
@@ -346,10 +434,34 @@ int main(int argc, char ** argv) {
         n_prompt_tokens = p.n_prompt;
     }
 
+    if (p.moe_hot_start) {
+        const uint32_t n_slots = llama_moe::n_slots_per_layer();
+        const uint32_t n_experts = llama_moe::n_experts_per_layer();
+        const std::string hot_start_path = p.moe_eamc_path.empty() ? default_eamc_path_of(p.model) : p.moe_eamc_path;
+        const std::vector<std::vector<int>> preload = load_hot_start_from_eamc(
+                hot_start_path,
+                (int) n_experts,
+                (int) n_slots);
+        if (preload.empty()) {
+            fprintf(stderr, "[moe-bench] warning: --moe-hot-start requested but no compatible EAMC sidecar was loaded from %s\n",
+                    hot_start_path.c_str());
+        } else if (!llama_moe::slot_pool_hot_start(preload)) {
+            fprintf(stderr, "[moe-bench] ERROR: MoE hot-start preload failed\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+    }
+
     std::vector<double> ttft_ms;
+    std::vector<double> cold_ttft_ms;
+    std::vector<double> warm_ttft_ms;
     std::vector<double> tpot_ms;
     std::vector<double> total_ms;
     ttft_ms.reserve((size_t) p.n_repeat);
+    cold_ttft_ms.reserve((size_t) p.n_repeat);
+    warm_ttft_ms.reserve((size_t) p.n_repeat);
     tpot_ms.reserve((size_t) p.n_repeat);
     total_ms.reserve((size_t) p.n_repeat);
 
@@ -380,9 +492,16 @@ int main(int argc, char ** argv) {
         summary_ctx.n_slots = llama_moe::n_slots_per_layer();
         summary_ctx.n_experts = llama_moe::n_experts_per_layer();
         summary_ctx.streaming = llama_moe::streaming_mode();
+        summary_ctx.cache_reset_between_repeats = p.moe_reset_cache_between_repeats;
+        summary_ctx.warm_cache = p.moe_warm_cache;
+        summary_ctx.hot_start = p.moe_hot_start;
         summary_ctx.ttft_ms = average_or_zero(ttft_ms);
+        summary_ctx.cold_ttft_ms = average_or_zero(cold_ttft_ms);
+        summary_ctx.warm_ttft_ms = average_or_zero(warm_ttft_ms);
         summary_ctx.tpot_ms = average_or_zero(tpot_ms);
         summary_ctx.total_ms = total_ms.empty() ? summary_ctx.ttft_ms : average_or_zero(total_ms);
+        summary_ctx.cold_prefill_count = (int) cold_ttft_ms.size();
+        summary_ctx.warm_prefill_count = (int) warm_ttft_ms.size();
         summary_ctx.vram_peak_bytes = vram_peak_bytes;
         summary_ctx.vram_total_bytes = vram_total_bytes;
         summary_ctx.dram_peak_bytes = dram_peak_bytes;
@@ -415,11 +534,30 @@ int main(int argc, char ** argv) {
         return profile;
     };
 
+    if (p.moe_warm_cache) {
+        fprintf(stderr, "[moe-bench] warming MoE cache before measured repeats\n");
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_moe::set_profile_request_context(-1, -1, "warmup");
+        llama_batch warm_batch = llama_batch_get_one(prompt_tokens.data(), n_prompt_tokens);
+        if (llama_decode(ctx, warm_batch) != 0) {
+            fprintf(stderr, "warm-cache prefill decode failed\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        llama_moe::reset_profile();
+    }
+
     for (int rep = 0; rep < p.n_repeat; ++rep) {
         llama_memory_clear(llama_get_memory(ctx), true);
+        if (p.moe_reset_cache_between_repeats) {
+            llama_moe::slot_pool_reset_cache();
+        }
         llama_perf_context_reset(ctx);
 
         const double t0 = now_ms();
+        llama_moe::set_profile_request_context(rep, 0, "prefill");
         llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt_tokens);
         if (llama_decode(ctx, batch) != 0) {
             fprintf(stderr, "prefill decode failed (rep %d)\n", rep);
@@ -427,12 +565,20 @@ int main(int argc, char ** argv) {
             break;
         }
         const double t1 = now_ms();
-        ttft_ms.push_back(t1 - t0);
+        const double measured_ttft_ms = t1 - t0;
+        ttft_ms.push_back(measured_ttft_ms);
+        const bool measured_prefill_warm = !p.moe_reset_cache_between_repeats && (p.moe_warm_cache || rep > 0);
+        if (measured_prefill_warm) {
+            warm_ttft_ms.push_back(measured_ttft_ms);
+        } else {
+            cold_ttft_ms.push_back(measured_ttft_ms);
+        }
         write_summary(false);
 
         llama_token token = greedy_token(ctx, vocab_size);
         for (int gen = 0; gen < p.n_gen; ++gen) {
             batch = llama_batch_get_one(&token, 1);
+            llama_moe::set_profile_request_context(rep, gen + 1, "decode");
             if (llama_decode(ctx, batch) != 0) {
                 fprintf(stderr, "decode failed at gen %d (rep %d)\n", gen, rep);
                 exit_code = 1;
@@ -449,6 +595,11 @@ int main(int argc, char ** argv) {
         vram_peak_bytes = std::max(vram_peak_bytes, sample_vram_used_bytes(&vram_total_bytes));
         dram_peak_bytes = std::max(dram_peak_bytes, process_dram_peak_bytes());
         write_summary(false);
+    }
+
+    if (!llama_moe::flush_predictor()) {
+        fprintf(stderr, "[moe-bench] ERROR: failed to flush MoE predictor state\n");
+        exit_code = 1;
     }
 
     fprintf(stderr, "[moe-bench] computing summary...\n");

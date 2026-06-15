@@ -44,7 +44,7 @@ struct moe_io_state {
     std::vector<cudaEvent_t>  event_pool;        // free events
     size_t                    events_in_use = 0; // for diagnostics
 
-    static constexpr size_t kEventPoolHardCap = 128;
+    static constexpr size_t kEventPoolHardCap = 4096;
 };
 
 moe_io_state g_state;
@@ -177,6 +177,20 @@ GGML_BACKEND_API bool moe_io_cuda_event_sync(void * ev) {
         return false;
     }
     return true;
+}
+
+// Non-blocking completion query for an event.
+GGML_BACKEND_API bool moe_io_cuda_event_query(void * ev) {
+    if (!ev) return false;
+    cudaError_t e = cudaEventQuery((cudaEvent_t) ev);
+    if (e == cudaSuccess) {
+        return true;
+    }
+    if (e == cudaErrorNotReady) {
+        return false;
+    }
+    fprintf(stderr, "[moe-io-cuda] cudaEventQuery failed: %s\n", cudaGetErrorString(e));
+    return false;
 }
 
 // Diagnostic: number of events currently checked out of the pool.

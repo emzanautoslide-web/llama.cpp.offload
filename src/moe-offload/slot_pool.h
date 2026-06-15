@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <string>
+#include <vector>
 
 struct ggml_tensor;
 struct llama_hparams;
@@ -21,6 +22,15 @@ void configure_slot_pool();
 // Reset per-load bookkeeping (slot tensor registry). Tensors themselves live in
 // the loader's ctx_map and outlive this reset.
 void reset_slot_pool();
+
+// Reset only streaming cache residency and counters. Slot tensors and graph
+// registrations remain intact. Intended for benchmark calibration.
+LLAMA_API void slot_pool_reset_cache();
+
+// Benchmark-only hot start: preload selected experts into streaming slots
+// before measured prefill. `experts_by_layer[logical_layer]` is ordered by
+// caller preference; the loader fills at most n_slots per layer.
+LLAMA_API bool slot_pool_hot_start(const std::vector<std::vector<int>> & experts_by_layer);
 
 // Returns the uniform slot count per MoE layer.
 LLAMA_API uint32_t n_slots_per_layer();
@@ -77,6 +87,7 @@ bool prefetch_all_experts();
 // MUL_MAT_ID. In full-residency mode the original expert IDs are used.
 void register_slot_table_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * slot_table);
 void register_slot_ids_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * slot_ids);
+void register_weights_for_topk(int logical_layer, ggml_tensor * topk, ggml_tensor * weights);
 void populate_slot_tables_identity();
 
 // Clear per-graph-build slot_table bookkeeping (topk->slot_table maps and the
@@ -104,8 +115,15 @@ void slot_pool_shutdown_io();
 // back to synchronous ggml_backend_tensor_set).
 void slot_pool_set_compute_backend(ggml_backend_t backend);
 
-// Phase E-3: end the current request (calls predictor.end_request).
+// Reset per-request predictor observations before an internal decode batch.
+void slot_pool_begin_request();
+
+// End the current internal decode batch (calls predictor.end_request, but does
+// not persist predictor sidecars).
 void slot_pool_end_request();
+
+// Persist predictor state at a logical request/session boundary.
+bool slot_pool_flush_predictor();
 
 // Phase D-2: scheduler eval-callback. On post-eval of `ffn_moe_topk-<il>` it
 // reads selected expert IDs, ensures their blobs are resident in slots (loading

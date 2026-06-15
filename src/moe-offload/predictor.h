@@ -12,6 +12,14 @@ enum class predictor_kind {
     eamc,
 };
 
+struct predictor_score_stats {
+    uint64_t eamc_rows_scored = 0;
+    int64_t  eamc_cosine_us = 0;
+    int64_t  eamc_score_materialize_us = 0;
+    uint64_t eamc_score_cache_hits = 0;
+    uint64_t eamc_score_cache_misses = 0;
+};
+
 predictor_kind parse_predictor_kind(const std::string & name);
 const char * predictor_kind_name(predictor_kind kind);
 
@@ -26,6 +34,7 @@ public:
     virtual void end_request() = 0;
     virtual bool load(const std::string & path);
     virtual bool save(const std::string & path) const;
+    virtual predictor_score_stats take_score_stats() const;
 };
 
 std::unique_ptr<predictor> make_predictor(
