@@ -98,6 +98,17 @@ measured bench-like `llama-cli` decode speed: LRU was 28.36 ms/token in CLI
 versus 27.26 ms/token in bench, and EAMC was 34.59 ms/token in CLI versus
 31.27 ms/token in bench.
 
+The same caution applies to prefill/TTFT. The default bench prompt is repeated
+`Hello. ` text, which has high expert locality and amortizes cold slot loads
+over many tokens and repeats. Short chat prompts have fewer tokens and lower
+prefill hit rate, so their per-token prefill number can look much worse even
+when total TTFT is reasonable. In the final prefill check, a short raw bench
+prompt measured 76.95 ms/token while the short CLI chat prompt measured
+71.70 ms/token; with a long repeated chat prompt, CLI measured
+21.87 ms/token versus 28.30 ms/token for a single-repeat 256-token bench run.
+`LLAMA_MOE_PREFILL_MMVQ=1` remains experimental: it only slightly improved the
+short CLI TTFT in this check and regressed decode TPOT.
+
 Use `llama-completion -no-cnv` for raw completion and logit diagnostics. Avoid
 using `-p "Hello"` as a system prompt in conversation mode; it seeds the
 conversation as user-visible text.
@@ -154,8 +165,10 @@ factor.
 The bench tool enables MoE offload automatically, runs prefill + decode loops,
 and always prints the summary report to stdout. It is a synthetic direct-decode
 measurement; use matched settings before comparing its TPOT to interactive
-`llama-cli`. It accepts `-ub`, `--ubatch`, and `--ubatch-size` for explicit
-prefill-ubatch measurements. Use
+`llama-cli`. For prefill comparisons, also match prompt length and prompt
+locality; repeated synthetic prompts can overstate interactive tokens/s. It
+accepts `-ub`, `--ubatch`, and `--ubatch-size` for explicit prefill-ubatch
+measurements. Use
 `--moe-reset-cache-between-repeats` to measure cold-cache prefill for every
 repeat, `--moe-warm-cache` to run one unmeasured cache warmup before timing,
 and `--moe-hot-start` for benchmark-only EAMC-sidecar preloading. Hot-start is
