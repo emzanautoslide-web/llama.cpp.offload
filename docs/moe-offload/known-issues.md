@@ -1,10 +1,10 @@
 # MoE Offload Known Issues
 
-Status as of the guarded Phase K closeout on 2026-06-12.
+Status as of the final CLI closeout on 2026-06-15.
 
 ## Open
 
-### Batched Streaming Chat Prefill Remains Conservative By Default
+### Batched Streaming Chat Prefill Is Conservative Unless Fast Profile Is Requested
 
 `llama-cli --moe-offload` produced wrong visible answers for simple chat
 prompts such as `who are you?`, `what is the capital of France?`, and
@@ -14,8 +14,11 @@ answered cleanly when streaming prefill was reduced to single-token ubatches.
 
 Current status:
 
-- `llama-cli --moe-offload` defaults to correctness-first `n_ubatch=1` unless
-  `LLAMA_MOE_STREAMING_UBATCH` is explicitly set.
+- `llama-cli --moe-offload` defaults to correctness-first `n_ubatch=1`.
+- `llama-cli --moe-offload --moe-fast-paths` applies the accepted guard stack
+  and lets the runtime auto-size streaming ubatch.
+- On the final CLI closeout run, 12000 MiB cache produced effective
+  `n_ubatch=16` and passed the formatted chat smoke.
 - The validated chat invocation is `llama-cli --jinja --reasoning off`.
 - `LLAMA_MOE_STREAMING_UBATCH=4` has leaked extra `</think>` text.
 - `LLAMA_MOE_STREAMING_UBATCH=8` has streamed reasoning text instead of the
@@ -30,11 +33,16 @@ Current status:
   and 64.
 - Phase K formatted `llama-cli --jinja --reasoning off` chat smoke passed at
   the default ubatch and forced `LLAMA_MOE_STREAMING_UBATCH=8`.
+- Final CLI closeout added `--moe-fast-paths` / `LLAMA_MOE_FAST_PATHS=1`. The
+  fast profile enables `LLAMA_MOE_SLOT_MMVQ=1`,
+  `LLAMA_MOE_SLOT_GRAPHS=1`, and `LLAMA_MOE_SLOT_GLU_FUSION=1`, while forcing
+  `LLAMA_MOE_PREFILL_MMVQ=0` and `LLAMA_MOE_TOPK_FUSION_DIAG=0`.
 
 Mitigation:
 
-- The broader Phase K gate passed, but the interactive default remains ubatch 1
-  for now because historical failures were prompt- and frontend-sensitive.
+- Use `--moe-fast-paths` for human-facing interactive performance validation.
+- Omit `--moe-fast-paths` or set `LLAMA_MOE_STREAMING_UBATCH=1` for the
+  conservative fallback.
 - Benchmark and diagnostic tools may force larger ubatches; rerun the
   formatted-chat smoke when changing the accepted guard stack or chat frontend.
 
@@ -50,7 +58,8 @@ semantics.
 
 Current guidance:
 
-- Use `llama-cli --moe-offload --jinja --reasoning off` for interactive chat.
+- Use `llama-cli --moe-offload --moe-fast-paths --jinja --reasoning off` for
+  fast interactive chat.
 - Use `llama-completion -no-cnv` for raw completion and logit diagnostics.
 - Avoid using `-p "Hello"` as a system prompt in conversation mode; it seeds
   user-visible conversation text.

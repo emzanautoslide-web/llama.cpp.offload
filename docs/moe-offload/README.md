@@ -30,8 +30,9 @@ models:
 .\build-moe\bin\Release\llama-cli.exe `
   --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
   --moe-offload `
-  --moe-cache-vram-mb 8000 `
+  --moe-cache-vram-mb 12000 `
   --moe-predictor lru `
+  --moe-fast-paths `
   --jinja `
   --reasoning off `
   -sys "You are a helpful assistant."
@@ -42,10 +43,11 @@ instructions. Use `--reasoning off` for normal chat; `--reasoning-budget 0`
 can still stream reasoning text for this model and is not the recommended chat
 setting.
 
-`llama-cli --moe-offload` defaults to correctness-first `n_ubatch=1` because
-the current batched streaming prefill path can corrupt Qwen MoE chat logits.
-Set `LLAMA_MOE_STREAMING_UBATCH=N` only for diagnostics while the batched path
-remains under investigation.
+`llama-cli --moe-offload` defaults to correctness-first `n_ubatch=1` unless
+`--moe-fast-paths` or `LLAMA_MOE_FAST_PATHS=1` is set. The fast profile uses
+the accepted Phase K guard stack, lets the runtime auto-size streaming ubatch,
+and prints the effective `n_ubatch` after model load. Keep
+`LLAMA_MOE_STREAMING_UBATCH=N` only for diagnostics or fallback testing.
 
 Set `LLAMA_MOE_SLOT_MMVQ=1` to enable the guarded CUDA `.slot` quantized
 single-token MMVQ decode fast path. Set `LLAMA_MOE_SLOT_GRAPHS=1` as well to
@@ -60,6 +62,30 @@ disabled for normal `.slot`/offload runs. Phase H adds
 only; it is default-off because the same-build benchmark did not show a
 material TPOT or `topk_d2h_us` gain. Phase H's large prefill win came from the
 default strided top-k callback read fix, not from enabling top-k fusion.
+
+`--moe-fast-paths` is the documented human-facing profile for interactive
+chat. It enables the accepted guards above, leaves prefill MMVQ disabled, and
+does not turn on diagnostic top-k fusion.
+
+To profile the same interactive path:
+
+```powershell
+.\build-moe\bin\Release\llama-cli.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --moe-offload `
+  --moe-cache-vram-mb 12000 `
+  --moe-predictor lru `
+  --moe-fast-paths `
+  --moe-profile-csv tests\moe-offload\_out\cli-profile.csv `
+  --moe-profile-summary tests\moe-offload\_out\cli-profile.summary.txt `
+  --jinja `
+  --reasoning off `
+  -sys "You are a helpful assistant."
+```
+
+The fallback path is the same command without `--moe-fast-paths`; it reports
+effective `n_ubatch=1`. You can also set `LLAMA_MOE_STREAMING_UBATCH=1` to
+force the conservative path during diagnostics.
 
 Use `llama-completion -no-cnv` for raw completion and logit diagnostics. Avoid
 using `-p "Hello"` as a system prompt in conversation mode; it seeds the
@@ -89,7 +115,8 @@ context/session teardown. EAMC scoring uses sparse in-memory activation rows,
 an indexed cosine pass, and lazy per-callback score materialization. The default
 path scores the full corpus; `LLAMA_MOE_EAMC_ROWS=N` is diagnostic-only and
 must be hit-rate gated before becoming a default. `--moe-profile-csv PATH` and
-`--moe-profile-summary PATH` write profiling data.
+`--moe-profile-summary PATH` write profiling data. CLI profile CSV is
+per-layer/request; the summary now follows the bench-style MoE report shape.
 
 In streaming mode (`n_slots < n_experts`), the runtime auto-sizes the effective
 `n_ubatch` from the cache VRAM budget and model top-k instead of applying the
