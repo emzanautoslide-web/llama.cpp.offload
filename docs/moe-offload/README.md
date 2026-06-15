@@ -87,6 +87,17 @@ The fallback path is the same command without `--moe-fast-paths`; it reports
 effective `n_ubatch=1`. You can also set `LLAMA_MOE_STREAMING_UBATCH=1` to
 force the conservative path during diagnostics.
 
+Short interactive turns are not valid TPOT comparisons against
+`llama-moe-bench`: bench runs a synthetic direct-decode loop with a fixed prompt
+and generation length, while `llama-cli` adds chat-template, server-task,
+streaming, sampling, and console work and may route to a different expert set.
+Use the same cache budget, predictor, fast-path stack, cache reset/warm policy,
+and enough generated tokens to average out cold-start noise. In the final
+Phase G closeout check, matched 12000 MiB runs with the accepted guard stack
+measured bench-like `llama-cli` decode speed: LRU was 28.36 ms/token in CLI
+versus 27.26 ms/token in bench, and EAMC was 34.59 ms/token in CLI versus
+31.27 ms/token in bench.
+
 Use `llama-completion -no-cnv` for raw completion and logit diagnostics. Avoid
 using `-p "Hello"` as a system prompt in conversation mode; it seeds the
 conversation as user-visible text.
@@ -141,8 +152,10 @@ factor.
 ```
 
 The bench tool enables MoE offload automatically, runs prefill + decode loops,
-and always prints the summary report to stdout. It accepts `-ub`, `--ubatch`,
-and `--ubatch-size` for explicit prefill-ubatch measurements. Use
+and always prints the summary report to stdout. It is a synthetic direct-decode
+measurement; use matched settings before comparing its TPOT to interactive
+`llama-cli`. It accepts `-ub`, `--ubatch`, and `--ubatch-size` for explicit
+prefill-ubatch measurements. Use
 `--moe-reset-cache-between-repeats` to measure cold-cache prefill for every
 repeat, `--moe-warm-cache` to run one unmeasured cache warmup before timing,
 and `--moe-hot-start` for benchmark-only EAMC-sidecar preloading. Hot-start is

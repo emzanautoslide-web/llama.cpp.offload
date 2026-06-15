@@ -4,13 +4,12 @@ Status as of the final CLI closeout on 2026-06-15.
 
 ## Open
 
-### Batched Streaming Chat Prefill Is Conservative Unless Fast Profile Is Requested
+### Default `llama-cli` Chat Prefill Remains Conservative
 
-`llama-cli --moe-offload` produced wrong visible answers for simple chat
-prompts such as `who are you?`, `what is the capital of France?`, and
-`what is 1 + 1?` when streaming chat prefill used multi-token ubatches. The
-same model answered cleanly without MoE offload, and the offloaded path
-answered cleanly when streaming prefill was reduced to single-token ubatches.
+Earlier `llama-cli --moe-offload` builds produced wrong visible answers for
+simple chat prompts when streaming chat prefill used multi-token ubatches. The
+final closeout fast profile is now validated, but the default CLI path remains
+conservative so users have an easy fallback.
 
 Current status:
 
@@ -20,11 +19,9 @@ Current status:
 - On the final CLI closeout run, 12000 MiB cache produced effective
   `n_ubatch=16` and passed the formatted chat smoke.
 - The validated chat invocation is `llama-cli --jinja --reasoning off`.
-- `LLAMA_MOE_STREAMING_UBATCH=4` has leaked extra `</think>` text.
-- `LLAMA_MOE_STREAMING_UBATCH=8` has streamed reasoning text instead of the
-  final answer.
-- Async-H2D diagnostics, forced no-hit reloads, identity slot-table fill, and
-  compute synchronization diagnostics did not fix the chat issue.
+- Older pre-closeout forced-ubatch chat experiments leaked reasoning text or
+  produced poor visible answers. Do not use those historical runs to judge the
+  final fast profile.
 - Phase K reran the raw-completion golden-logit matrix with the accepted guard
   stack (`LLAMA_MOE_SLOT_MMVQ=1`, `LLAMA_MOE_SLOT_GRAPHS=1`,
   `LLAMA_MOE_SLOT_GLU_FUSION=1`, `LLAMA_MOE_PREFILL_MMVQ=0`,
@@ -47,6 +44,20 @@ Mitigation:
   formatted-chat smoke when changing the accepted guard stack or chat frontend.
 
 ## Current Limits And Caveats
+
+### `llama-cli` TPOT Requires Matched Workload Comparison
+
+The fast `llama-cli` path reaches bench-like decode speed when measured with
+the same cache budget, guard stack, predictor, and a sustained generation
+length. The final Phase G closeout runs at 12000 MiB measured:
+
+- LRU: `llama-moe-bench` 27.26 ms/token, `llama-cli` 28.36 ms/token.
+- EAMC: `llama-moe-bench` 31.27 ms/token, `llama-cli` 34.59 ms/token.
+
+Short chat turns can still report much slower TPOT because they may generate
+only a few tokens, use a different chat-template prompt, and route through a
+different expert/cache path. Do not treat a 9-token chat answer as equivalent
+to a 128-token benchmark run.
 
 ### `llama-completion` Conversation Mode Is Not The Supported Chat Frontend
 
