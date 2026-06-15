@@ -45,7 +45,7 @@ Mitigation:
 
 ## Current Limits And Caveats
 
-### `llama-cli` TPOT Requires Matched Workload Comparison
+### `llama-cli` TPOT And Prefill Require Matched Workload Comparison
 
 The fast `llama-cli` path reaches bench-like decode speed when measured with
 the same cache budget, guard stack, predictor, and a sustained generation
@@ -58,6 +58,23 @@ Short chat turns can still report much slower TPOT because they may generate
 only a few tokens, use a different chat-template prompt, and route through a
 different expert/cache path. Do not treat a 9-token chat answer as equivalent
 to a 128-token benchmark run.
+
+The same applies to prefill/TTFT. The faster bench prefill numbers come from a
+long repeated prompt and, in repeat-averaged runs, warmer OS/cache state. The
+prefill-specific closeout check found:
+
+- Short raw bench prompt: 27 prompt tokens, 76.95 ms/token, 24.0% prefill hit
+  rate.
+- Short CLI chat prompt: 51 prompt tokens, 71.70 ms/token, 41.7% prefill hit
+  rate.
+- Long repeated CLI chat prompt: 269 prompt tokens, 21.87 ms/token, 80.3%
+  prefill hit rate.
+- Single-repeat 256-token repeated bench prompt: 28.30 ms/token, 75.1%
+  prefill hit rate.
+
+So the current evidence does not show a CLI-specific prefill regression.
+`LLAMA_MOE_PREFILL_MMVQ=1` remains experimental because it gave only a small
+short-prompt TTFT improvement and worsened decode TPOT in the closeout check.
 
 ### `llama-completion` Conversation Mode Is Not The Supported Chat Frontend
 
